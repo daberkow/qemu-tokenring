@@ -292,6 +292,9 @@ static void tms380_pci_realize(PCIDevice *pci_dev, Error **errp)
 {
     TMS380PCIState *s = TMS380_PCI(pci_dev);
 
+    /* Set PCI interrupt pin A — required for IRQ assignment */
+    pci_dev->config[PCI_INTERRUPT_PIN] = 1;
+
     /* Register I/O BAR for SIF registers */
     memory_region_init_io(&s->io_bar, OBJECT(pci_dev), &tms380_io_ops, s,
                           "tms380-sif", TMS380_IO_SIZE);
