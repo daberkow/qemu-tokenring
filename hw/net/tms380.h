@@ -2,7 +2,7 @@
  * TMS380 Token Ring Adapter - PCI Device Model
  *
  * Emulates a Compaq 4/16 Token Ring PCI adapter (vendor 0x0E11,
- * device 0x0046) using the TMS380 SIF register interface.
+ * device 0x0508) using the TMS380 SIF register interface.
  * Works with the Linux tmspci + tms380tr drivers.
  */
 
@@ -17,7 +17,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(TMS380PCIState, TMS380_PCI)
 
 /* PCI IDs — Compaq 4/16 Token Ring PCI, matched by Linux tmspci driver */
 #define TMS380_PCI_VENDOR_ID    0x0E11
-#define TMS380_PCI_DEVICE_ID    0x0046
+#define TMS380_PCI_DEVICE_ID    0x0508
 
 /* SIF Register offsets from BAR0 */
 #define SIF_DAT     0x00    /* Data register (16-bit) */
