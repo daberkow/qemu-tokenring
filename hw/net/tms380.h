@@ -19,21 +19,50 @@ OBJECT_DECLARE_SIMPLE_TYPE(TMS380PCIState, TMS380_PCI)
 #define TMS380_PCI_VENDOR_ID    0x0E11
 #define TMS380_PCI_DEVICE_ID    0x0508
 
-/* SIF Register offsets from BAR0 */
-#define SIF_DAT     0x00    /* Data register (16-bit) */
-#define SIF_CMD     0x02    /* Command/status register */
-#define SIF_ADR     0x04    /* Address register */
-#define SIF_ACL     0x06    /* Adapter control/status */
+/*
+ * SIF Register offsets from BAR0.
+ * The TMS380 has 8 registers, each 16 bits wide.
+ * The Linux tms380tr driver accesses these via inw/outw.
+ */
+#define SIF_DAT     0x00    /* Data register */
+#define SIF_INC     0x02    /* Data + auto-increment DIO address */
+#define SIF_ADR     0x04    /* DIO address register (low) */
+#define SIF_CMD     0x06    /* Command (write) / Status (read) */
+#define SIF_ACL     0x08    /* Adapter control register */
+#define SIF_ADD     0x0a    /* DIO address (alternate low) */
+#define SIF_ADX     0x0c    /* DIO extended address (page/high) */
+#define SIF_DMALEN  0x0e    /* DMA length */
 
 /* SIF_ACL bits */
-#define SIFACL_ARESET   (1 << 8)    /* Adapter reset */
-#define SIFACL_INIT     (1 << 9)    /* Initializing (1=busy, 0=ready) */
-#define SIFACL_SINTEN   (1 << 1)    /* System interrupt enable */
+#define ACL_ARESET   0x0080  /* Adapter reset */
+#define ACL_CPHALT   0x0040  /* Communication processor halt */
+#define ACL_BOOT     0x0020  /* Bootstrap enable */
+#define ACL_SINTEN   0x0008  /* System interrupt enable */
+#define ACL_PEN      0x0004  /* Parity enable */
 
-/* SIF_CMD bits */
-#define SIFCMD_INTRESET (1 << 0)    /* Reset interrupt */
-#define SIFCMD_EXECUTE  (1 << 1)    /* Execute SRB command */
-#define SIFCMD_ADAP_INT (1 << 2)    /* Adapter interrupt pending */
+/* SIF_CMD/STS bits */
+#define CMD_INTERRUPT_ADAPTER  0x8000  /* Interrupt adapter */
+#define CMD_EXECUTE            0x4000  /* Execute */
+#define CMD_SCB_REQUEST        0x2000  /* SCB request */
+#define CMD_RCV_VALID          0x1000  /* Receive valid */
+#define CMD_RCV_CONTINUE       0x0800  /* Receive continue */
+#define CMD_CLEAR_SYSTEM_IRQ   0x00FF  /* Low byte: clear system IRQ mask */
+#define CMD_SSB_CLEAR          0x2000  /* SSB clear (same as SCB_REQUEST) */
+
+/* SIF_STS (read from CMD register) */
+#define STS_INITIALIZE  0x0040  /* Adapter initializing */
+#define STS_ERROR       0x0020  /* Error during init */
+#define STS_TEST        0x0010  /* Self-test in progress */
+#define STS_MASK        0x00F0  /* Status mask */
+#define STS_IRQ_MASK    0x000F  /* Interrupt type */
+
+/* Interrupt types (in STS low nibble) */
+#define STS_IRQ_ADAPTER_CHECK  0x0000
+#define STS_IRQ_RING_STATUS    0x0004
+#define STS_IRQ_SCB_CLEAR      0x0006
+#define STS_IRQ_COMMAND_STATUS 0x0008
+#define STS_IRQ_RECEIVE_STATUS 0x000A
+#define STS_IRQ_TRANSMIT_STATUS 0x000C
 
 /* SRB Command codes */
 #define SRB_CMD_OPEN            0x03
@@ -42,25 +71,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(TMS380PCIState, TMS380_PCI)
 #define SRB_CMD_SET_FUNCT_ADDR  0x07
 #define SRB_CMD_READ_ERROR_LOG  0x08
 
-/* SRB offsets */
-#define SRB_CMD_OFFSET      0
-#define SRB_RETCODE_OFFSET  2
-
-/* SRB return codes */
-#define SRB_SUCCESS         0x00
-
 /* Device states */
 typedef enum {
-    TMS_STATE_RESET,
-    TMS_STATE_READY,
-    TMS_STATE_OPEN,
+    TMS_STATE_RESET,      /* Hardware reset in progress */
+    TMS_STATE_BUD,        /* Bring-Up Diagnostics / firmware load */
+    TMS_STATE_INIT,       /* Initializing (IPB written, executing) */
+    TMS_STATE_READY,      /* Ready for OPEN */
+    TMS_STATE_OPEN,       /* Adapter open on ring */
 } TMS380DevState;
 
-/* Adapter shared memory size */
-#define TMS380_SRAM_SIZE    256
+/* Adapter RAM size for DIO access */
+#define TMS380_SRAM_SIZE    (64 * 1024)  /* 64KB adapter RAM */
 
-/* I/O BAR size: 8 bytes (4 x 16-bit registers) */
-/* tmspci driver requests TMS_PCI_IO_EXTENT = 32 bytes via request_region() */
+/* I/O BAR size: 32 bytes (tmspci driver requests TMS_PCI_IO_EXTENT = 32) */
 #define TMS380_IO_SIZE      32
 
 struct TMS380PCIState {
@@ -71,29 +94,35 @@ struct TMS380PCIState {
 
     /* SIF register values */
     uint16_t sifdat;
-    uint16_t sifcmd;
-    uint16_t sifadr;
     uint16_t sifacl;
+    uint16_t sifsts;      /* Status register (read from CMD offset) */
+    uint16_t sifcmd;      /* Last command written */
+
+    /* DIO (Direct I/O) addressing */
+    uint16_t dio_addr;    /* Current DIO address (low 16 bits) */
+    uint16_t dio_page;    /* DIO page (high bits via SIFADX) */
 
     /* MAC address */
     uint8_t mac[6];
 
-    /* Initialization data read sequence */
-    int init_read_index;
-
-    /* Timer for simulating reset delay */
+    /* Timer for simulating reset/init delays */
     QEMUTimer *reset_timer;
 
-    /* Adapter shared memory (SRB buffer) */
-    uint8_t sram[TMS380_SRAM_SIZE];
+    /* Adapter shared RAM — DIO reads/writes go here.
+     * The MAC address is placed at address 0x0000.
+     * SRB/SCB/SSB/ARB areas are at driver-configured offsets. */
+    uint8_t *sram;
+
+    /* SCB/SSB/SRB/ARB addresses (set during init via IPB) */
+    uint16_t scb_addr;
+    uint16_t ssb_addr;
 
     /* tr_backend FFI — loaded via dlopen */
-    void *backend_lib;      /* dlopen handle */
-    void *backend;          /* TrBackend* from tr_backend_create */
-    char *mau_path;         /* vmau socket path */
-    char *backend_lib_path; /* path to libtr_backend.so */
+    void *backend_lib;
+    void *backend;
+    char *mau_path;
+    char *backend_lib_path;
 
-    /* Function pointers resolved from backend_lib */
     void *(*fn_create)(const char *mau_path, const uint8_t *mac);
     int (*fn_insert)(void *backend);
     int (*fn_send)(void *backend, const uint8_t *dst, const uint8_t *data, uint32_t len);
