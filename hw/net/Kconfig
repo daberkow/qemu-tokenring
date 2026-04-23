@@ -160,5 +160,5 @@ config CAN_CTUCANFD_PCI
 
 config TMS380
     bool
-    default y
-    depends on ISA_BUS
+    default y if PCI_DEVICES
+    depends on PCI
