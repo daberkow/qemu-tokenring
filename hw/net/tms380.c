@@ -399,11 +399,21 @@ static void tms380_handle_srb(TMS380PCIState *s, uint8_t *srb, uint32_t srb_phys
         cpu_physical_memory_write(srb_phys, srb, 32);
     }
 
-    /* Write SSB completion to host memory */
+    /* Write SSB completion to host memory.
+     * SSB is big-endian: {u16 STS, u16 Parm[0], u16 Parm[1], u16 Parm[2]}
+     * STS = command code (e.g., 0x0300 for OPEN)
+     * Parm[0] = status (0x0080 = GOOD_COMPLETION for OPEN) */
     {
         uint8_t ssb[8] = {0};
-        ssb[0] = cmd;   /* Echo command */
-        ssb[2] = 0x00;  /* Success */
+        ssb[0] = 0x00;  /* STS high byte */
+        ssb[1] = cmd;   /* STS low byte = command code */
+        /* Wait — the driver reads ssb_cmd = tp->ssb.STS which is u16.
+         * OPEN = 0x0300. In BE memory: byte0=0x03, byte1=0x00. */
+        /* SSB is in host memory on LE x86. The driver reads fields as native u16.
+         * STS = OPEN (0x0300): LE bytes = {0x00, 0x03}
+         * Parm[0] = GOOD_COMPLETION (0x0080): LE bytes = {0x80, 0x00} */
+        ssb[0] = 0x00; ssb[1] = cmd;   /* STS = 0x0300 for OPEN (LE) */
+        ssb[2] = 0x80; ssb[3] = 0x00;  /* Parm[0] = GOOD_COMPLETION (LE) */
         cpu_physical_memory_write(s->ssb_addr, ssb, 8);
     }
 
