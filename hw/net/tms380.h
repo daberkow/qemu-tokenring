@@ -60,7 +60,8 @@ typedef enum {
 #define TMS380_SRAM_SIZE    256
 
 /* I/O BAR size: 8 bytes (4 x 16-bit registers) */
-#define TMS380_IO_SIZE      8
+/* tmspci driver requests TMS_PCI_IO_EXTENT = 32 bytes via request_region() */
+#define TMS380_IO_SIZE      32
 
 struct TMS380PCIState {
     PCIDevice parent_obj;
