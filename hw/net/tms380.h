@@ -114,8 +114,8 @@ struct TMS380PCIState {
     uint8_t *sram;
 
     /* SCB/SSB/SRB/ARB addresses (set during init via IPB) */
-    uint16_t scb_addr;
-    uint16_t ssb_addr;
+    uint32_t scb_addr;
+    uint32_t ssb_addr;
 
     /* tr_backend FFI — loaded via dlopen */
     void *backend_lib;

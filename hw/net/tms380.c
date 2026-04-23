@@ -287,7 +287,10 @@ static void tms380_handle_init(TMS380PCIState *s)
 
 static void tms380_raise_irq(TMS380PCIState *s, uint16_t irq_type)
 {
-    s->sifsts = (s->sifsts & ~STS_IRQ_MASK) | (irq_type & STS_IRQ_MASK);
+    /* Set the IRQ type in the low nibble and STS_SYSTEM_IRQ (bit 7)
+     * so the driver's interrupt handler enters its processing loop. */
+    s->sifsts = (s->sifsts & ~(STS_IRQ_MASK | 0x0080)) |
+                (irq_type & STS_IRQ_MASK) | 0x0080;
     pci_irq_assert(&s->parent_obj);
 }
 
@@ -299,21 +302,42 @@ static void tms380_handle_scb(TMS380PCIState *s)
     uint8_t scb[6];
     cpu_physical_memory_read(s->scb_addr, scb, 6);
 
-    uint16_t cmd = (scb[0] << 8) | scb[1];  /* Big-endian command */
-    /* Parameter is a 32-bit big-endian pointer to the command parameter block */
-    uint32_t parm_addr = ((uint32_t)scb[2] << 24) | ((uint32_t)scb[3] << 16) |
-                         ((uint32_t)scb[4] << 8) | scb[5];
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "tms380: SCB at phys 0x%08x: %02x %02x %02x %02x %02x %02x\n",
+                  s->scb_addr, scb[0], scb[1], scb[2], scb[3], scb[4], scb[5]);
+
+    /* The SCB struct is packed big-endian on the TMS380:
+     *   u16 CMD
+     *   u16 Parm[0]  (high word of 32-bit address)
+     *   u16 Parm[1]  (low word of 32-bit address)
+     * But the driver writes to host memory in native (LE) byte order,
+     * using cpu_to_be16() for each field. So the bytes in memory are BE. */
+    uint16_t cmd = (scb[0] << 8) | scb[1];
+    /* The Parm is SWAPW'd: Parm[0]=low16, Parm[1]=high16 of the address.
+     * Same SWAPW convention as IPB addresses. */
+    uint16_t parm_w0 = (scb[2] << 8) | scb[3];
+    uint16_t parm_w1 = (scb[4] << 8) | scb[5];
+    uint32_t parm_addr = ((uint32_t)parm_w0 << 16) | parm_w1;
 
     qemu_log_mask(LOG_GUEST_ERROR,
-                  "tms380: SCB cmd=0x%04x parm=0x%08x\n", cmd, parm_addr);
+                  "tms380: SCB cmd=0x%04x parm=0x%08x (w0=0x%04x w1=0x%04x)\n",
+                  cmd, parm_addr, parm_w0, parm_w1);
 
     /* Read the SRB/command parameter block from host memory */
     uint8_t srb[32];
     memset(srb, 0, sizeof(srb));
     if (parm_addr) {
         cpu_physical_memory_read(parm_addr, srb, sizeof(srb));
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "tms380: SRB raw: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                      srb[0], srb[1], srb[2], srb[3],
+                      srb[4], srb[5], srb[6], srb[7]);
     }
 
+    /* The SCB CMD field is the actual command code (e.g., 0x0003 = OPEN).
+     * The Parm points to the command's parameter block (e.g., OPB for OPEN).
+     * Override srb[0] with the SCB command code for our SRB handler. */
+    srb[0] = cmd & 0xFF;
     tms380_handle_srb(s, srb, parm_addr);
 }
 
@@ -485,16 +509,26 @@ static void tms380_io_write(void *opaque, hwaddr addr, uint64_t val,
                 /* The driver sends commands via SCB in host memory.
                  * CMD_INTERRUPT_ADAPTER signals a new command is ready.
                  * Read the SCB from host memory to find the SRB. */
-                if (v & CMD_INTERRUPT_ADAPTER) {
+                /* Only dispatch new commands, not SSB_CLEAR acks */
+                if ((v & CMD_INTERRUPT_ADAPTER) && !(v & CMD_SSB_CLEAR)) {
                     tms380_handle_scb(s);
                 }
             }
         }
 
-        /* Clear system interrupt when requested */
-        if (v & 0x00FF) {
+        /* Clear system interrupt when the driver writes the low byte (ACK).
+         * The driver writes CMD_SSB_CLEAR | CMD_INTERRUPT_ADAPTER (0xA0XX)
+         * to acknowledge a command completion interrupt.
+         * CMD_SSB_CLEAR = 0x2000, CMD_INTERRUPT_ADAPTER = 0x8000.
+         * We clear the IRQ whenever CMD_SSB_CLEAR is set. */
+        if (v & CMD_SSB_CLEAR) {
             pci_irq_deassert(&s->parent_obj);
-            s->sifsts &= ~STS_IRQ_MASK;
+            s->sifsts &= ~(STS_IRQ_MASK | 0x0080);
+        }
+        /* Also clear on any low-byte write without CMD_INTERRUPT_ADAPTER */
+        else if ((v & 0x00FF) && !(v & CMD_INTERRUPT_ADAPTER)) {
+            pci_irq_deassert(&s->parent_obj);
+            s->sifsts &= ~(STS_IRQ_MASK | 0x0080);
         }
         break;
 
