@@ -395,6 +395,26 @@ static void tms380_rx_poll(void *opaque)
 
     qemu_log_mask(LOG_GUEST_ERROR, "tms380: RX: %d bytes from backend\n", n);
 
+    /* Only deliver LLC frames (FC=0x40) to the guest. Skip MAC control
+     * frames (claim token, ring purge, AMP/SMP) from the MAC state machine. */
+    if (n >= 2 && frame[1] != 0x40) {
+        goto reschedule;
+    }
+
+    /* Skip our own frames returning from ring circulation.
+     * SA is at offset 8 in the 802.5 frame (after AC+FC+DA). */
+    /* Skip our own frames returning from ring circulation.
+     * SA is at offset 8. The first byte of SA may have the RII bit (0x80)
+     * set for source routing — mask it off before comparing. */
+    if (n >= 14) {
+        uint8_t sa[6];
+        memcpy(sa, &frame[8], 6);
+        sa[0] &= 0x7F;  /* Clear RII bit */
+        if (memcmp(sa, s->mac, 6) == 0) {
+            goto reschedule;
+        }
+    }
+
     /* Read the current RPL from host memory.
      * RPL layout: NextRPLAddr(4, BE) + Status(2, LE) + FrameSize(2, BE)
      *           + FragList[0]: DataCount(2, BE) + DataAddr(4, BE)  */
@@ -433,8 +453,19 @@ static void tms380_rx_poll(void *opaque)
     rpl[4] = done_status & 0xFF;        /* Status LE low */
     rpl[5] = (done_status >> 8) & 0xFF; /* Status LE high */
 
-    /* Write updated RPL back */
-    cpu_physical_memory_write(s->rpl_addr, rpl, 8); /* Only need first 8 bytes */
+    /* Write updated RPL: Status and FrameSize only (4 bytes at offset 4) */
+    cpu_physical_memory_write(s->rpl_addr + 4, &rpl[4], 4);
+
+    /* Verify */
+    {
+        uint8_t vrpl[14];
+        cpu_physical_memory_read(s->rpl_addr, vrpl, 14);
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "tms380: RX: RPL verify: next=%02x%02x%02x%02x sts=%02x%02x fsz=%02x%02x dc=%02x%02x da=%02x%02x%02x%02x\n",
+                      vrpl[0], vrpl[1], vrpl[2], vrpl[3],
+                      vrpl[4], vrpl[5], vrpl[6], vrpl[7],
+                      vrpl[8], vrpl[9], vrpl[10], vrpl[11], vrpl[12], vrpl[13]);
+    }
 
     /* Advance to next RPL. NextRPLAddr is __be32 at offset 0 = stored BE */
     uint32_t next_rpl = ((uint32_t)rpl[0] << 24) | ((uint32_t)rpl[1] << 16) |
