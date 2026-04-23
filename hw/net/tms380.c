@@ -96,27 +96,21 @@ static bool tms380_load_backend(TMS380PCIState *s)
 
 /* --- Reset and initialization --- */
 
-static void tms380_reset_done(void *opaque)
+static void tms380_bud_done(void *opaque)
 {
     TMS380PCIState *s = opaque;
 
-    /* Transition from RESET → BUD.
-     * The driver expects to see STS_INITIALIZE in SIFSTS after BUD completes. */
+    /* BUD complete — set STS_INITIALIZE to tell driver we're ready for IPB.
+     * The driver polls SIFSTS after sending the soft reset command. */
     s->dev_state = TMS_STATE_BUD;
-
-    /* BUD complete — set STS_INITIALIZE to tell driver we're ready for IPB */
     s->sifsts = STS_INITIALIZE;
-
-    /* Clear reset/halt bits in ACL */
-    s->sifacl &= ~(ACL_ARESET | ACL_CPHALT);
-
     qemu_log_mask(LOG_GUEST_ERROR, "tms380: BUD complete, awaiting init\n");
 }
 
 static void tms380_do_reset(TMS380PCIState *s)
 {
     s->dev_state = TMS_STATE_RESET;
-    s->sifsts = STS_TEST;  /* Self-test in progress */
+    s->sifsts = 0;  /* No status bits during reset */
     s->sifcmd = 0;
     s->dio_addr = 0;
     s->dio_page = 0;
@@ -124,13 +118,24 @@ static void tms380_do_reset(TMS380PCIState *s)
     /* Place MAC address at SRAM address 0x0000 (big-endian, one byte per word).
      * The tmspci driver reads it as: SIFADX=0, SIFADR=0, then 6x SIFINC >> 8 */
     for (int i = 0; i < 6; i++) {
-        s->sram[i * 2] = s->mac[i];      /* High byte of each word */
-        s->sram[i * 2 + 1] = 0x00;       /* Low byte (ignored by driver) */
+        s->sram[i * 2] = s->mac[i];
+        s->sram[i * 2 + 1] = 0x00;
     }
 
-    /* Simulate BUD delay — 50ms virtual time */
+    qemu_log_mask(LOG_GUEST_ERROR, "tms380: hardware reset\n");
+    /* Don't start BUD timer here — wait for the soft reset command */
+}
+
+/* Called when driver sends EXEC_SOFT_RESET (0xFF00) to SIFCMD.
+ * This happens after firmware download and CPHALT clear.
+ * Start BUD and set STS_INITIALIZE after a short delay. */
+static void tms380_soft_reset(TMS380PCIState *s)
+{
+    qemu_log_mask(LOG_GUEST_ERROR, "tms380: soft reset, starting BUD\n");
+    s->sifsts = STS_TEST;  /* Test in progress briefly */
+    /* BUD completes quickly — use a timer so the driver's poll loop works */
     timer_mod(s->reset_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 50 * SCALE_MS);
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1 * SCALE_MS);
 }
 
 /* Handle the initialization command (after driver writes IPB and sends CMD_EXECUTE) */
@@ -279,23 +284,22 @@ static void tms380_io_write(void *opaque, hwaddr addr, uint64_t val,
     case SIF_CMD:   /* 0x06 — command register */
         s->sifcmd = v;
 
+        /* EXEC_SOFT_RESET = 0xFF00: driver sends this after firmware download
+         * to start BUD (Bring Up Diagnostics). */
+        if (v == 0xFF00 && s->dev_state == TMS_STATE_RESET) {
+            tms380_soft_reset(s);
+            break;
+        }
+
         /* Handle command bits */
         if (v & CMD_EXECUTE) {
-            if (s->dev_state == TMS_STATE_BUD) {
-                /* Driver sent EXEC_SOFT_RESET (0xFF00) or CMD_EXECUTE during init.
-                 * If we're in BUD state with STS_INITIALIZE set, this is the
-                 * init command after IPB write. */
-                if (s->sifsts & STS_INITIALIZE) {
-                    /* Still in BUD waiting for IPB — this is the init execute */
-                    tms380_handle_init(s);
-                }
+            if (s->dev_state == TMS_STATE_BUD &&
+                (s->sifsts & STS_INITIALIZE)) {
+                /* BUD done, driver wrote IPB and sent CMD_EXECUTE — init */
+                tms380_handle_init(s);
             } else if (s->dev_state == TMS_STATE_READY ||
                        s->dev_state == TMS_STATE_OPEN) {
-                /* SCB request — the driver wrote a command to the SCB area.
-                 * Read the SRB address from the SCB and process it. */
                 if (v & CMD_SCB_REQUEST) {
-                    /* The SCB contains the SRB address at a known offset.
-                     * For simplicity, use the DIO address as the SRB location. */
                     uint16_t srb_addr = s->dio_addr;
                     tms380_handle_srb(s, srb_addr);
                 }
@@ -360,7 +364,7 @@ static void tms380_pci_realize(PCIDevice *pci_dev, Error **errp)
     pci_register_bar(pci_dev, 0, PCI_BASE_ADDRESS_SPACE_IO, &s->io_bar);
 
     /* Create reset timer */
-    s->reset_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tms380_reset_done, s);
+    s->reset_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tms380_bud_done, s);
 
     /* Load backend if configured */
     tms380_load_backend(s);
