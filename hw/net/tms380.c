@@ -228,6 +228,55 @@ static void tms380_handle_init(TMS380PCIState *s)
                       verify[4], verify[5]);
     }
 
+    /* After init, the adapter OVERWRITES the IPB area (page 1, offset 0x0A00)
+     * with the INTPTRS structure (8 x 16-bit pointers). The driver reads this
+     * via tms380tr_read_ptr() to find adapter internals.
+     *
+     * INTPTRS layout (tms380tr.h):
+     *   Word 0: BurnedInAddrPtr  — pointer to BIA in adapter RAM
+     *   Word 1: SoftwareLevelPtr — pointer to software level
+     *   Word 2: AdapterAddrPtr   — pointer to adapter address
+     *   Word 3: AdapterParmsPtr  — pointer to adapter parameters
+     *   Word 4: MACBufferPtr     — pointer to MAC buffer
+     *   Word 5: LLCCountersPtr   — pointer to LLC counters
+     *   Word 6: SpeedFlagPtr     — pointer to speed flag
+     *   Word 7: AdapterRAMPtr    — pointer to RAM size value (in KB)
+     *
+     * Each pointer is a big-endian 16-bit address within page 1 of SRAM.
+     * The driver dereferences these to read the actual data.
+     */
+
+    /* Place data values at known SRAM locations (page 1) */
+    /* RAM size at page 1, offset 0x0B00: 64KB = 0x0040 in KB (big-endian) */
+    uint32_t ram_size_addr = 0x10000 + 0x0B00;
+    s->sram[ram_size_addr] = 0x00;
+    s->sram[ram_size_addr + 1] = 0x40;  /* 64 KB */
+
+    /* Speed flag at page 1, offset 0x0B10: 16 Mbps = 0x0010 */
+    uint32_t speed_addr = 0x10000 + 0x0B10;
+    s->sram[speed_addr] = 0x00;
+    s->sram[speed_addr + 1] = 0x10;
+
+    /* Now write the INTPTRS structure at page 1, offset 0x0A00.
+     * Pointers are big-endian 16-bit SRAM offsets within page 1. */
+    uint32_t intptrs = 0x10000 + 0x0A00;
+    /* Word 0: BurnedInAddrPtr → offset 0x0000 (MAC is at page 0, addr 0) */
+    s->sram[intptrs + 0] = 0x00; s->sram[intptrs + 1] = 0x00;
+    /* Word 1: SoftwareLevelPtr → 0x0B20 */
+    s->sram[intptrs + 2] = 0x0B; s->sram[intptrs + 3] = 0x20;
+    /* Word 2: AdapterAddrPtr → 0x0000 */
+    s->sram[intptrs + 4] = 0x00; s->sram[intptrs + 5] = 0x00;
+    /* Word 3: AdapterParmsPtr → 0x0B30 */
+    s->sram[intptrs + 6] = 0x0B; s->sram[intptrs + 7] = 0x30;
+    /* Word 4: MACBufferPtr → 0x0B40 */
+    s->sram[intptrs + 8] = 0x0B; s->sram[intptrs + 9] = 0x40;
+    /* Word 5: LLCCountersPtr → 0x0B50 */
+    s->sram[intptrs + 10] = 0x0B; s->sram[intptrs + 11] = 0x50;
+    /* Word 6: SpeedFlagPtr → 0x0B10 */
+    s->sram[intptrs + 12] = 0x0B; s->sram[intptrs + 13] = 0x10;
+    /* Word 7: AdapterRAMPtr → 0x0B00 (where we stored the RAM size) */
+    s->sram[intptrs + 14] = 0x0B; s->sram[intptrs + 15] = 0x00;
+
     /* Clear all status bits to signal init complete */
     s->sifsts = 0;
     s->dev_state = TMS_STATE_READY;
@@ -242,12 +291,38 @@ static void tms380_raise_irq(TMS380PCIState *s, uint16_t irq_type)
     pci_irq_assert(&s->parent_obj);
 }
 
-static void tms380_handle_srb(TMS380PCIState *s, uint16_t srb_addr)
-{
-    uint8_t cmd = s->sram[srb_addr];
+static void tms380_handle_srb(TMS380PCIState *s, uint8_t *srb, uint32_t srb_phys);
 
-    qemu_log_mask(LOG_GUEST_ERROR, "tms380: SRB command 0x%02x at 0x%04x\n",
-                  cmd, srb_addr);
+/* Read SCB from host memory and dispatch the command */
+static void tms380_handle_scb(TMS380PCIState *s)
+{
+    uint8_t scb[6];
+    cpu_physical_memory_read(s->scb_addr, scb, 6);
+
+    uint16_t cmd = (scb[0] << 8) | scb[1];  /* Big-endian command */
+    /* Parameter is a 32-bit big-endian pointer to the command parameter block */
+    uint32_t parm_addr = ((uint32_t)scb[2] << 24) | ((uint32_t)scb[3] << 16) |
+                         ((uint32_t)scb[4] << 8) | scb[5];
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "tms380: SCB cmd=0x%04x parm=0x%08x\n", cmd, parm_addr);
+
+    /* Read the SRB/command parameter block from host memory */
+    uint8_t srb[32];
+    memset(srb, 0, sizeof(srb));
+    if (parm_addr) {
+        cpu_physical_memory_read(parm_addr, srb, sizeof(srb));
+    }
+
+    tms380_handle_srb(s, srb, parm_addr);
+}
+
+static void tms380_handle_srb(TMS380PCIState *s, uint8_t *srb, uint32_t srb_phys)
+{
+    uint8_t cmd = srb[0];
+
+    qemu_log_mask(LOG_GUEST_ERROR, "tms380: SRB cmd=0x%02x at phys 0x%08x\n",
+                  cmd, srb_phys);
 
     switch (cmd) {
     case SRB_CMD_OPEN:
@@ -255,21 +330,19 @@ static void tms380_handle_srb(TMS380PCIState *s, uint16_t srb_addr)
             s->backend = s->fn_create(s->mau_path, s->mac);
             if (s->backend && s->fn_insert(s->backend) == 0) {
                 s->dev_state = TMS_STATE_OPEN;
-                s->sram[srb_addr + 2] = 0x00; /* success */
-                qemu_log_mask(LOG_GUEST_ERROR,
-                              "tms380: OPEN success, on ring\n");
+                srb[2] = 0x00;
+                qemu_log_mask(LOG_GUEST_ERROR, "tms380: OPEN success\n");
             } else {
                 if (s->backend) {
                     s->fn_destroy(s->backend);
                     s->backend = NULL;
                 }
-                s->sram[srb_addr + 2] = 0x07;
+                srb[2] = 0x07;
                 qemu_log_mask(LOG_GUEST_ERROR, "tms380: OPEN failed\n");
             }
         } else {
-            /* No backend — stub success for testing */
             s->dev_state = TMS_STATE_OPEN;
-            s->sram[srb_addr + 2] = 0x00;
+            srb[2] = 0x00;
             qemu_log_mask(LOG_GUEST_ERROR, "tms380: OPEN (stub)\n");
         }
         break;
@@ -280,23 +353,37 @@ static void tms380_handle_srb(TMS380PCIState *s, uint16_t srb_addr)
             s->backend = NULL;
         }
         s->dev_state = TMS_STATE_READY;
-        s->sram[srb_addr + 2] = 0x00;
+        srb[2] = 0x00;
+        qemu_log_mask(LOG_GUEST_ERROR, "tms380: CLOSE\n");
         break;
 
     case SRB_CMD_SET_FUNCT_ADDR:
     case SRB_CMD_SET_GROUP_ADDR:
     case SRB_CMD_READ_ERROR_LOG:
-        s->sram[srb_addr + 2] = 0x00; /* success */
+        srb[2] = 0x00;
+        qemu_log_mask(LOG_GUEST_ERROR, "tms380: SRB 0x%02x (stub OK)\n", cmd);
         break;
 
     default:
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "tms380: unknown SRB 0x%02x\n", cmd);
-        s->sram[srb_addr + 2] = 0x04;
+        qemu_log_mask(LOG_GUEST_ERROR, "tms380: unknown SRB 0x%02x\n", cmd);
+        srb[2] = 0x04;
         break;
     }
 
-    /* Signal command completion */
+    /* Write SRB result back to host memory */
+    if (srb_phys) {
+        cpu_physical_memory_write(srb_phys, srb, 32);
+    }
+
+    /* Write SSB completion to host memory */
+    {
+        uint8_t ssb[8] = {0};
+        ssb[0] = cmd;   /* Echo command */
+        ssb[2] = 0x00;  /* Success */
+        cpu_physical_memory_write(s->ssb_addr, ssb, 8);
+    }
+
+    /* Raise command completion interrupt */
     tms380_raise_irq(s, STS_IRQ_COMMAND_STATUS);
 }
 
@@ -395,9 +482,11 @@ static void tms380_io_write(void *opaque, hwaddr addr, uint64_t val,
                 tms380_handle_init(s);
             } else if (s->dev_state == TMS_STATE_READY ||
                        s->dev_state == TMS_STATE_OPEN) {
-                if (v & CMD_SCB_REQUEST) {
-                    uint16_t srb_addr = s->dio_addr;
-                    tms380_handle_srb(s, srb_addr);
+                /* The driver sends commands via SCB in host memory.
+                 * CMD_INTERRUPT_ADAPTER signals a new command is ready.
+                 * Read the SCB from host memory to find the SRB. */
+                if (v & CMD_INTERRUPT_ADAPTER) {
+                    tms380_handle_scb(s);
                 }
             }
         }
