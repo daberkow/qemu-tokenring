@@ -119,7 +119,10 @@ struct TMS380PCIState {
 
     /* TPL/RPL chain addresses (set by TRANSMIT/RECEIVE commands) */
     uint32_t tpl_addr;    /* Head of transmit parameter list chain */
-    uint32_t rpl_addr;    /* Head of receive parameter list chain */
+    uint32_t rpl_addr;    /* Current receive parameter list pointer */
+
+    /* RX polling timer */
+    QEMUTimer *rx_timer;
 
     /* tr_backend FFI — loaded via dlopen */
     void *backend_lib;

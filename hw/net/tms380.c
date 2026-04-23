@@ -23,6 +23,21 @@
 #include "tms380.h"
 #include <dlfcn.h>
 
+/* SCB Operation Codes (from Linux tms380tr.h) */
+#define OC_OPEN             0x0300
+#define OC_TRANSMIT         0x0400
+#define OC_TRANSMIT_HALT    0x0500
+#define OC_RECEIVE          0x0600
+#define OC_CLOSE            0x0700
+#define OC_SET_GROUP_ADDR   0x0800
+#define OC_SET_FUNCT_ADDR   0x0900
+#define OC_READ_ERROR_LOG   0x0A00
+#define GOOD_COMPLETION     0x0080
+
+/* Forward declarations */
+static void tms380_write_ssb(TMS380PCIState *s, uint16_t sts, uint16_t parm0);
+static void tms380_raise_irq(TMS380PCIState *s, uint16_t irq_type);
+
 /* --- DIO (Direct I/O) helpers --- */
 
 /* Read a 16-bit word from adapter SRAM at the current DIO address */
@@ -334,18 +349,98 @@ static void tms380_handle_scb(TMS380PCIState *s)
     tms380_handle_command(s, cmd, srb, parm_addr);
 }
 
-/* SCB Operation Codes */
-#define OC_OPEN             0x0300
-#define OC_TRANSMIT         0x0400
-#define OC_TRANSMIT_HALT    0x0500
-#define OC_RECEIVE          0x0600
-#define OC_CLOSE            0x0700
-#define OC_SET_GROUP_ADDR   0x0800
-#define OC_SET_FUNCT_ADDR   0x0900
-#define OC_READ_ERROR_LOG   0x0A00
-#define GOOD_COMPLETION     0x0080
+/* --- RX processing --- */
 
-static void tms380_write_ssb(TMS380PCIState *s, uint16_t sts, uint16_t parm0);
+#define RX_VALID        0x0080
+#define RX_START_FRAME  0x0020
+#define RX_END_FRAME    0x0010
+#define RX_FRAME_IRQ    0x0008
+
+/* Poll the raw backend for received frames and DMA them into the guest */
+static void tms380_rx_poll(void *opaque)
+{
+    TMS380PCIState *s = opaque;
+
+    if (!s->backend || !s->fn_raw_recv) {
+        goto reschedule;
+    }
+    if (!s->rpl_addr) {
+        /* RECEIVE command not yet issued — just drain the backend */
+        uint8_t discard[18000];
+        s->fn_raw_recv(s->backend, discard, sizeof(discard));
+        goto reschedule;
+    }
+
+    /* Try to receive a frame from the backend */
+    uint8_t frame[18000];
+    int n = s->fn_raw_recv(s->backend, frame, sizeof(frame));
+    if (n <= 0) {
+        goto reschedule;
+    }
+
+    qemu_log_mask(LOG_GUEST_ERROR, "tms380: RX: %d bytes from backend\n", n);
+
+    /* Read the current RPL from host memory.
+     * RPL layout: NextRPLAddr(4, BE) + Status(2, LE) + FrameSize(2, BE)
+     *           + FragList[0]: DataCount(2, BE) + DataAddr(4, BE)  */
+    uint8_t rpl[14];
+    cpu_physical_memory_read(s->rpl_addr, rpl, sizeof(rpl));
+
+    /* Check if RPL is valid (ready for receive) */
+    uint16_t status = rpl[4] | (rpl[5] << 8); /* LE */
+    if (!(status & RX_VALID)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "tms380: RX: RPL not valid (0x%04x)\n", status);
+        goto reschedule;
+    }
+
+    /* Get the data buffer address from FragList[0] */
+    uint32_t data_addr = ((uint32_t)rpl[10] << 24) | ((uint32_t)rpl[11] << 16) |
+                         ((uint32_t)rpl[12] << 8) | rpl[13];
+    /* Also try reading as htonl stored in two LE u16 words like SCB parm */
+    /* FragList.DataAddr is __be32, so it's stored BE in memory = read as BE */
+
+    if (data_addr == 0) {
+        qemu_log_mask(LOG_GUEST_ERROR, "tms380: RX: no data buffer in RPL\n");
+        goto reschedule;
+    }
+
+    qemu_log_mask(LOG_GUEST_ERROR, "tms380: RX: writing %d bytes to DMA 0x%08x\n",
+                  n, data_addr);
+
+    /* DMA-write the frame into the guest's receive buffer */
+    cpu_physical_memory_write(data_addr, frame, n);
+
+    /* Update RPL: set FrameSize (BE) and completion status (LE) */
+    rpl[6] = (n >> 8) & 0xFF;  /* FrameSize BE high */
+    rpl[7] = n & 0xFF;         /* FrameSize BE low */
+
+    uint16_t done_status = RX_START_FRAME | RX_END_FRAME | RX_FRAME_IRQ;
+    rpl[4] = done_status & 0xFF;        /* Status LE low */
+    rpl[5] = (done_status >> 8) & 0xFF; /* Status LE high */
+
+    /* Write updated RPL back */
+    cpu_physical_memory_write(s->rpl_addr, rpl, 8); /* Only need first 8 bytes */
+
+    /* Advance to next RPL. NextRPLAddr is __be32 at offset 0 = stored BE */
+    uint32_t next_rpl = ((uint32_t)rpl[0] << 24) | ((uint32_t)rpl[1] << 16) |
+                        ((uint32_t)rpl[2] << 8) | rpl[3];
+    /* Mask off odd bit (indicates last RPL) */
+    if (next_rpl & 1) {
+        /* Last RPL — wrap back to start? For now, just keep current */
+        qemu_log_mask(LOG_GUEST_ERROR, "tms380: RX: last RPL in chain\n");
+    } else if (next_rpl != 0) {
+        s->rpl_addr = next_rpl;
+    }
+
+    /* Write SSB for receive and raise interrupt */
+    tms380_write_ssb(s, OC_RECEIVE, GOOD_COMPLETION);
+    tms380_raise_irq(s, STS_IRQ_RECEIVE_STATUS);
+
+reschedule:
+    /* Poll every 1ms */
+    timer_mod(s->rx_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SCALE_MS);
+}
 
 /* --- TX processing --- */
 
@@ -444,6 +539,9 @@ static void tms380_handle_command(TMS380PCIState *s, uint16_t cmd,
             s->backend = s->fn_raw_create(s->mau_path, s->mac);
             if (s->backend) {
                 s->dev_state = TMS_STATE_OPEN;
+                /* Start RX polling timer */
+                timer_mod(s->rx_timer,
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 10 * SCALE_MS);
                 qemu_log_mask(LOG_GUEST_ERROR, "tms380: OPEN success (raw backend)\n");
             } else {
                 qemu_log_mask(LOG_GUEST_ERROR, "tms380: OPEN failed (raw backend)\n");
@@ -691,8 +789,9 @@ static void tms380_pci_realize(PCIDevice *pci_dev, Error **errp)
                           "tms380-sif", TMS380_IO_SIZE);
     pci_register_bar(pci_dev, 0, PCI_BASE_ADDRESS_SPACE_IO, &s->io_bar);
 
-    /* Create reset timer */
+    /* Create timers */
     s->reset_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tms380_bud_done, s);
+    s->rx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tms380_rx_poll, s);
 
     /* Load backend if configured */
     tms380_load_backend(s);
@@ -711,6 +810,8 @@ static void tms380_pci_exit(PCIDevice *pci_dev)
     TMS380PCIState *s = TMS380_PCI(pci_dev);
 
     timer_free(s->reset_timer);
+    timer_del(s->rx_timer);
+    timer_free(s->rx_timer);
 
     if (s->backend && s->fn_raw_destroy) {
         s->fn_raw_destroy(s->backend);
