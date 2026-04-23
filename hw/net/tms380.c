@@ -454,7 +454,7 @@ static void tms380_rx_poll(void *opaque)
 reschedule:
     /* Poll every 1ms */
     timer_mod(s->rx_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SCALE_MS);
+              qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 10 * SCALE_MS);
 }
 
 /* --- TX processing --- */
@@ -555,7 +555,7 @@ static void tms380_handle_command(TMS380PCIState *s, uint16_t cmd,
             if (s->backend) {
                 s->dev_state = TMS_STATE_OPEN;
                 timer_mod(s->rx_timer,
-                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 10 * SCALE_MS);
+                          qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 10 * SCALE_MS);
                 qemu_log_mask(LOG_GUEST_ERROR, "tms380: OPEN success (raw backend)\n");
             } else {
                 qemu_log_mask(LOG_GUEST_ERROR, "tms380: OPEN failed (raw backend)\n");
@@ -814,7 +814,7 @@ static void tms380_pci_realize(PCIDevice *pci_dev, Error **errp)
 
     /* Create timers */
     s->reset_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tms380_bud_done, s);
-    s->rx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tms380_rx_poll, s);
+    s->rx_timer = timer_new_ns(QEMU_CLOCK_REALTIME, tms380_rx_poll, s);
     /* Use REALTIME for deferred interrupts — VIRTUAL doesn't advance when
      * the vCPU is halted (e.g., in interruptible_sleep_on). */
     s->scb_clear_timer = timer_new_ns(QEMU_CLOCK_REALTIME, tms380_scb_clear_cb, s);
