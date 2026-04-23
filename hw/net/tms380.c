@@ -393,7 +393,13 @@ static void tms380_rx_poll(void *opaque)
         uint8_t sa[6];
         memcpy(sa, &frame[8], 6);
         sa[0] &= 0x7F;
-        if (memcmp(sa, s->mac, 6) == 0) return;
+        if (memcmp(sa, s->mac, 6) == 0) {
+            qemu_log_mask(LOG_GUEST_ERROR, "tms380: RX: filtered own frame (%d bytes)\n", n);
+            return;
+        }
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "tms380: RX: %d bytes SA=%02x:%02x:%02x:%02x:%02x:%02x (not ours)\n",
+                      n, frame[8], frame[9], frame[10], frame[11], frame[12], frame[13]);
     }
 
     if (!s->rpl_addr) return;
@@ -528,6 +534,15 @@ static void tms380_handle_command(TMS380PCIState *s, uint16_t cmd,
 
     switch (cmd) {
     case OC_OPEN:
+        if (s->backend) {
+            /* Already open — just re-ack */
+            s->dev_state = TMS_STATE_OPEN;
+            qemu_log_mask(LOG_GUEST_ERROR, "tms380: OPEN (already open)\n");
+            tms380_write_ssb(s, cmd, GOOD_COMPLETION);
+            timer_mod(s->cmd_status_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 100 * SCALE_MS);
+            break;
+        }
         if (s->fn_raw_create && s->mau_path && s->mau_path[0]) {
             s->backend = s->fn_raw_create(s->mau_path, s->mac);
             if (s->backend) {
@@ -564,8 +579,13 @@ static void tms380_handle_command(TMS380PCIState *s, uint16_t cmd,
         break;
 
     case OC_CLOSE:
-        if (s->backend && s->fn_raw_destroy) {
-            s->fn_raw_destroy(s->backend);
+        if (s->backend) {
+            /* Unregister the RX fd handler before destroying backend */
+            if (s->fn_raw_get_recv_fd) {
+                int fd = s->fn_raw_get_recv_fd(s->backend);
+                if (fd >= 0) qemu_set_fd_handler(fd, NULL, NULL, NULL);
+            }
+            if (s->fn_raw_destroy) s->fn_raw_destroy(s->backend);
             s->backend = NULL;
         }
         s->dev_state = TMS_STATE_READY;
