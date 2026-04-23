@@ -20,6 +20,8 @@
 #include "qemu/timer.h"
 #include "qemu/log.h"
 #include "exec/cpu-common.h"
+#include "io/channel-watch.h"
+#include "qemu/main-loop.h"
 #include "tms380.h"
 #include <dlfcn.h>
 
@@ -371,121 +373,64 @@ static void tms380_handle_scb(TMS380PCIState *s)
 #define RX_END_FRAME    0x0010
 #define RX_FRAME_IRQ    0x0008
 
-/* Poll the raw backend for received frames and DMA them into the guest */
+/* Called when the raw backend's recv fd is readable — a frame arrived */
 static void tms380_rx_poll(void *opaque)
 {
     TMS380PCIState *s = opaque;
 
-    if (!s->backend || !s->fn_raw_recv) {
-        goto reschedule;
-    }
-    if (!s->rpl_addr) {
-        /* RECEIVE command not yet issued — just drain the backend */
-        uint8_t discard[18000];
-        s->fn_raw_recv(s->backend, discard, sizeof(discard));
-        goto reschedule;
-    }
+    if (!s->backend || !s->fn_raw_recv) return;
 
-    /* Try to receive a frame from the backend */
+    /* Read frame from backend */
     uint8_t frame[18000];
     int n = s->fn_raw_recv(s->backend, frame, sizeof(frame));
-    if (n <= 0) {
-        goto reschedule;
-    }
+    if (n <= 0) return;
 
-    qemu_log_mask(LOG_GUEST_ERROR, "tms380: RX: %d bytes from backend\n", n);
+    /* Filter: only LLC frames (FC=0x40) */
+    if (n < 14 || frame[1] != 0x40) return;
 
-    /* Only deliver LLC frames (FC=0x40) to the guest. Skip MAC control
-     * frames (claim token, ring purge, AMP/SMP) from the MAC state machine. */
-    if (n >= 2 && frame[1] != 0x40) {
-        goto reschedule;
-    }
-
-    /* Skip our own frames returning from ring circulation.
-     * SA is at offset 8 in the 802.5 frame (after AC+FC+DA). */
-    /* Skip our own frames returning from ring circulation.
-     * SA is at offset 8. The first byte of SA may have the RII bit (0x80)
-     * set for source routing — mask it off before comparing. */
-    if (n >= 14) {
+    /* Filter: skip own frames (SA with RII bit masked) */
+    {
         uint8_t sa[6];
         memcpy(sa, &frame[8], 6);
-        sa[0] &= 0x7F;  /* Clear RII bit */
-        if (memcmp(sa, s->mac, 6) == 0) {
-            goto reschedule;
-        }
+        sa[0] &= 0x7F;
+        if (memcmp(sa, s->mac, 6) == 0) return;
     }
 
-    /* Read the current RPL from host memory.
-     * RPL layout: NextRPLAddr(4, BE) + Status(2, LE) + FrameSize(2, BE)
-     *           + FragList[0]: DataCount(2, BE) + DataAddr(4, BE)  */
+    if (!s->rpl_addr) return;
+
+    /* Read RPL: NextRPLAddr(4) + Status(2) + FrameSize(2) + Frag0(6) */
     uint8_t rpl[14];
     cpu_physical_memory_read(s->rpl_addr, rpl, sizeof(rpl));
 
-    /* Check if RPL is valid (ready for receive) */
-    uint16_t status = rpl[4] | (rpl[5] << 8); /* LE */
-    if (!(status & RX_VALID)) {
-        qemu_log_mask(LOG_GUEST_ERROR, "tms380: RX: RPL not valid (0x%04x)\n", status);
-        goto reschedule;
-    }
+    uint16_t status = rpl[4] | (rpl[5] << 8);
+    if (!(status & RX_VALID)) return;  /* RPL not ready */
 
-    /* Get the data buffer address from FragList[0] */
+    /* Get data buffer DMA address (BE u32) */
     uint32_t data_addr = ((uint32_t)rpl[10] << 24) | ((uint32_t)rpl[11] << 16) |
                          ((uint32_t)rpl[12] << 8) | rpl[13];
-    /* Also try reading as htonl stored in two LE u16 words like SCB parm */
-    /* FragList.DataAddr is __be32, so it's stored BE in memory = read as BE */
+    if (!data_addr) return;
 
-    if (data_addr == 0) {
-        qemu_log_mask(LOG_GUEST_ERROR, "tms380: RX: no data buffer in RPL\n");
-        goto reschedule;
-    }
+    qemu_log_mask(LOG_GUEST_ERROR, "tms380: RX: %d bytes → DMA 0x%08x\n", n, data_addr);
 
-    qemu_log_mask(LOG_GUEST_ERROR, "tms380: RX: writing %d bytes to DMA 0x%08x\n",
-                  n, data_addr);
-
-    /* DMA-write the frame into the guest's receive buffer */
+    /* DMA frame into guest buffer */
     cpu_physical_memory_write(data_addr, frame, n);
 
-    /* Update RPL: set FrameSize (BE) and completion status (LE) */
-    rpl[6] = (n >> 8) & 0xFF;  /* FrameSize BE high */
-    rpl[7] = n & 0xFF;         /* FrameSize BE low */
-
-    uint16_t done_status = RX_START_FRAME | RX_END_FRAME | RX_FRAME_IRQ;
-    rpl[4] = done_status & 0xFF;        /* Status LE low */
-    rpl[5] = (done_status >> 8) & 0xFF; /* Status LE high */
-
-    /* Write updated RPL: Status and FrameSize only (4 bytes at offset 4) */
+    /* Update RPL: FrameSize (BE) + completion status (LE, clear RX_VALID) */
+    rpl[6] = (n >> 8) & 0xFF;
+    rpl[7] = n & 0xFF;
+    uint16_t done = RX_START_FRAME | RX_END_FRAME | RX_FRAME_IRQ;
+    rpl[4] = done & 0xFF;
+    rpl[5] = (done >> 8) & 0xFF;
     cpu_physical_memory_write(s->rpl_addr + 4, &rpl[4], 4);
 
-    /* Verify */
-    {
-        uint8_t vrpl[14];
-        cpu_physical_memory_read(s->rpl_addr, vrpl, 14);
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "tms380: RX: RPL verify: next=%02x%02x%02x%02x sts=%02x%02x fsz=%02x%02x dc=%02x%02x da=%02x%02x%02x%02x\n",
-                      vrpl[0], vrpl[1], vrpl[2], vrpl[3],
-                      vrpl[4], vrpl[5], vrpl[6], vrpl[7],
-                      vrpl[8], vrpl[9], vrpl[10], vrpl[11], vrpl[12], vrpl[13]);
-    }
+    /* Advance to next RPL (BE u32, odd bit = last) */
+    uint32_t next = ((uint32_t)rpl[0] << 24) | ((uint32_t)rpl[1] << 16) |
+                    ((uint32_t)rpl[2] << 8) | rpl[3];
+    if (!(next & 1) && next) s->rpl_addr = next;
 
-    /* Advance to next RPL. NextRPLAddr is __be32 at offset 0 = stored BE */
-    uint32_t next_rpl = ((uint32_t)rpl[0] << 24) | ((uint32_t)rpl[1] << 16) |
-                        ((uint32_t)rpl[2] << 8) | rpl[3];
-    /* Mask off odd bit (indicates last RPL) */
-    if (next_rpl & 1) {
-        /* Last RPL — wrap back to start? For now, just keep current */
-        qemu_log_mask(LOG_GUEST_ERROR, "tms380: RX: last RPL in chain\n");
-    } else if (next_rpl != 0) {
-        s->rpl_addr = next_rpl;
-    }
-
-    /* Write SSB for receive and raise interrupt */
-    tms380_write_ssb(s, OC_RECEIVE, GOOD_COMPLETION);
-    tms380_raise_irq(s, STS_IRQ_RECEIVE_STATUS);
-
-reschedule:
-    /* Poll every 1ms */
-    timer_mod(s->rx_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 10 * SCALE_MS);
+    /* DEBUG: skip interrupt — test if DMA+RPL update alone is safe */
+    /* tms380_write_ssb(s, OC_RECEIVE, GOOD_COMPLETION);
+    tms380_raise_irq(s, STS_IRQ_RECEIVE_STATUS); */
 }
 
 /* --- TX processing --- */
@@ -585,8 +530,17 @@ static void tms380_handle_command(TMS380PCIState *s, uint16_t cmd,
             s->backend = s->fn_raw_create(s->mau_path, s->mac);
             if (s->backend) {
                 s->dev_state = TMS_STATE_OPEN;
-                timer_mod(s->rx_timer,
-                          qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 10 * SCALE_MS);
+                /* Use QEMU's fd handler instead of polling timer.
+                 * The raw backend provides a notification fd that becomes
+                 * readable when a frame arrives. */
+                {
+                    int recv_fd = s->fn_raw_get_recv_fd(s->backend);
+                    if (recv_fd >= 0) {
+                        qemu_set_fd_handler(recv_fd, tms380_rx_poll, NULL, s);
+                        qemu_log_mask(LOG_GUEST_ERROR,
+                                      "tms380: RX: registered fd %d for receive\n", recv_fd);
+                    }
+                }
                 qemu_log_mask(LOG_GUEST_ERROR, "tms380: OPEN success (raw backend)\n");
             } else {
                 qemu_log_mask(LOG_GUEST_ERROR, "tms380: OPEN failed (raw backend)\n");
