@@ -117,6 +117,10 @@ struct TMS380PCIState {
     uint32_t scb_addr;
     uint32_t ssb_addr;
 
+    /* TPL/RPL chain addresses (set by TRANSMIT/RECEIVE commands) */
+    uint32_t tpl_addr;    /* Head of transmit parameter list chain */
+    uint32_t rpl_addr;    /* Head of receive parameter list chain */
+
     /* tr_backend FFI — loaded via dlopen */
     void *backend_lib;
     void *backend;

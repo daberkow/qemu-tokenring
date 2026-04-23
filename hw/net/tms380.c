@@ -296,6 +296,7 @@ static void tms380_raise_irq(TMS380PCIState *s, uint16_t irq_type)
 
 static void tms380_handle_command(TMS380PCIState *s, uint16_t cmd,
                                   uint8_t *parm, uint32_t parm_phys);
+static void tms380_process_tx(TMS380PCIState *s);
 
 /* Read SCB from host memory and dispatch the command */
 static void tms380_handle_scb(TMS380PCIState *s)
@@ -307,18 +308,17 @@ static void tms380_handle_scb(TMS380PCIState *s)
                   "tms380: SCB at phys 0x%08x: %02x %02x %02x %02x %02x %02x\n",
                   s->scb_addr, scb[0], scb[1], scb[2], scb[3], scb[4], scb[5]);
 
-    /* The SCB is in host memory in native (LE) byte order.
-     * The driver writes: tp->scb.CMD = OPEN (0x0300) etc.
-     * On LE x86, u16 0x0300 stores as {0x00, 0x03}. */
-    uint16_t cmd = scb[0] | (scb[1] << 8);  /* LE u16 */
-    uint16_t parm_w0 = scb[2] | (scb[3] << 8);  /* LE u16 Parm[0] = LOWORD */
-    uint16_t parm_w1 = scb[4] | (scb[5] << 8);  /* LE u16 Parm[1] = HIWORD */
-    /* Parm is SWAPW'd: Parm[0]=low16, Parm[1]=high16 of physical address */
-    uint32_t parm_addr = ((uint32_t)parm_w1 << 16) | parm_w0;
+    /* SCB is in host memory, native LE byte order.
+     * CMD is a LE u16. */
+    uint16_t cmd = scb[0] | (scb[1] << 8);
+    /* Parm is htonl(dma_addr) stored as two LE u16 words.
+     * Reading the 4 parm bytes as a BE u32 gives the original address. */
+    uint32_t parm_addr = ((uint32_t)scb[2] << 24) | ((uint32_t)scb[3] << 16) |
+                         ((uint32_t)scb[4] << 8) | scb[5];
 
     qemu_log_mask(LOG_GUEST_ERROR,
-                  "tms380: SCB cmd=0x%04x parm=0x%08x (w0=0x%04x w1=0x%04x)\n",
-                  cmd, parm_addr, parm_w0, parm_w1);
+                  "tms380: SCB cmd=0x%04x parm=0x%08x\n",
+                  cmd, parm_addr);
 
     /* Read the SRB/command parameter block from host memory */
     uint8_t srb[32];
@@ -335,7 +335,7 @@ static void tms380_handle_scb(TMS380PCIState *s)
     tms380_handle_command(s, cmd, srb, parm_addr);
 }
 
-/* SCB Operation Codes (from tms380tr.h) */
+/* SCB Operation Codes */
 #define OC_OPEN             0x0300
 #define OC_TRANSMIT         0x0400
 #define OC_TRANSMIT_HALT    0x0500
@@ -344,9 +344,88 @@ static void tms380_handle_scb(TMS380PCIState *s)
 #define OC_SET_GROUP_ADDR   0x0800
 #define OC_SET_FUNCT_ADDR   0x0900
 #define OC_READ_ERROR_LOG   0x0A00
-
-/* GOOD_COMPLETION status for SSB */
 #define GOOD_COMPLETION     0x0080
+
+static void tms380_write_ssb(TMS380PCIState *s, uint16_t sts, uint16_t parm0);
+
+/* --- TX processing --- */
+
+/* TPL status bits */
+#define TX_VALID        0x0080
+#define TX_START_FRAME  0x0020
+#define TX_END_FRAME    0x0010
+#define TX_FRAME_IRQ    0x0008
+
+/* Process pending transmit: read TPL from host memory, extract frame, send */
+static void tms380_process_tx(TMS380PCIState *s)
+{
+    qemu_log_mask(LOG_GUEST_ERROR, "tms380: process_tx tpl=0x%08x\n", s->tpl_addr);
+    if (!s->tpl_addr) return;
+
+    /* Read the TPL header from host memory.
+     * TPL layout (all big-endian in adapter protocol, but stored native LE by driver):
+     *   u32 NextTPLAddr  (4 bytes) — actually BE on wire
+     *   u16 Status       (2 bytes) — LE in host memory
+     *   u16 FrameSize    (2 bytes) — BE
+     *   Fragment[0]: u16 DataCount (BE), u32 DataAddr (BE)
+     */
+    uint8_t tpl[14]; /* NextTPL(4) + Status(2) + FrameSize(2) + Frag0(6) */
+    cpu_physical_memory_read(s->tpl_addr, tpl, sizeof(tpl));
+
+    /* Status is native LE u16 at offset 4 */
+    uint16_t status = tpl[4] | (tpl[5] << 8);
+
+    if (!(status & TX_VALID)) {
+        return; /* No valid frame to transmit */
+    }
+
+    /* FrameSize is BE u16 at offset 6 */
+    uint16_t frame_size = (tpl[6] << 8) | tpl[7];
+
+    /* Fragment 0: DataCount (BE u16) at offset 8, DataAddr (BE u32) at offset 10 */
+    uint16_t data_count = (tpl[8] << 8) | tpl[9];
+    data_count &= 0x7FFF; /* Clear MORE_FRAGMENTS bit */
+    uint32_t data_addr = ((uint32_t)tpl[10] << 24) | ((uint32_t)tpl[11] << 16) |
+                         ((uint32_t)tpl[12] << 8) | tpl[13];
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "tms380: TX: status=0x%04x size=%d count=%d addr=0x%08x\n",
+                  status, frame_size, data_count, data_addr);
+
+    if (data_count == 0 || data_addr == 0) return;
+
+    /* Read the frame data from host memory */
+    uint8_t *frame = g_malloc(data_count);
+    cpu_physical_memory_read(data_addr, frame, data_count);
+
+    /* Send via backend if available */
+    if (s->backend && s->fn_send && data_count > 14) {
+        /* Frame starts with AC(1) + FC(1) + DA(6) + SA(6) + payload
+         * Extract DA for tr_backend_send */
+        uint8_t *dst_mac = &frame[2]; /* DA at offset 2 */
+        uint8_t *payload = &frame[14]; /* Payload after header */
+        uint16_t payload_len = data_count - 14;
+        s->fn_send(s->backend, dst_mac, payload, payload_len);
+        qemu_log_mask(LOG_GUEST_ERROR, "tms380: TX: sent %d bytes via backend\n",
+                      data_count);
+    } else {
+        qemu_log_mask(LOG_GUEST_ERROR, "tms380: TX: %d bytes (no backend)\n",
+                      data_count);
+    }
+
+    g_free(frame);
+
+    /* Mark TPL as complete: clear TX_VALID, set completion status.
+     * Write status back as LE u16 at offset 4. */
+    uint16_t done_status = TX_START_FRAME | TX_END_FRAME | TX_FRAME_IRQ;
+    tpl[4] = done_status & 0xFF;
+    tpl[5] = (done_status >> 8) & 0xFF;
+    cpu_physical_memory_write(s->tpl_addr + 4, &tpl[4], 2);
+
+    /* Write SSB for transmit completion */
+    tms380_write_ssb(s, 0x0400 /* TRANSMIT */, GOOD_COMPLETION);
+    tms380_raise_irq(s, STS_IRQ_TRANSMIT_STATUS);
+}
 
 static void tms380_write_ssb(TMS380PCIState *s, uint16_t sts, uint16_t parm0)
 {
@@ -402,9 +481,9 @@ static void tms380_handle_command(TMS380PCIState *s, uint16_t cmd,
         break;
 
     case OC_TRANSMIT:
-        /* The Parm points to the TPL (Transmit Parameter List) in host memory.
-         * For now, just acknowledge. TX data path comes next. */
-        qemu_log_mask(LOG_GUEST_ERROR, "tms380: TRANSMIT (stub)\n");
+        /* Save the TPL chain head address for CMD_TX_VALID processing */
+        s->tpl_addr = parm_phys;
+        qemu_log_mask(LOG_GUEST_ERROR, "tms380: TRANSMIT tpl=0x%08x\n", parm_phys);
         tms380_write_ssb(s, cmd, GOOD_COMPLETION);
         tms380_raise_irq(s, STS_IRQ_COMMAND_STATUS);
         break;
@@ -416,9 +495,9 @@ static void tms380_handle_command(TMS380PCIState *s, uint16_t cmd,
         break;
 
     case OC_RECEIVE:
-        /* The Parm points to the RPL (Receive Parameter List) in host memory.
-         * For now, just acknowledge. RX data path comes next. */
-        qemu_log_mask(LOG_GUEST_ERROR, "tms380: RECEIVE (stub)\n");
+        /* Save the RPL chain head address for receive processing */
+        s->rpl_addr = parm_phys;
+        qemu_log_mask(LOG_GUEST_ERROR, "tms380: RECEIVE rpl=0x%08x\n", parm_phys);
         tms380_write_ssb(s, cmd, GOOD_COMPLETION);
         tms380_raise_irq(s, STS_IRQ_COMMAND_STATUS);
         break;
@@ -517,6 +596,11 @@ static void tms380_io_write(void *opaque, hwaddr addr, uint64_t val,
         s->sifcmd = v;
         qemu_log_mask(LOG_GUEST_ERROR, "tms380: SIFCMD write 0x%04x state=%d\n",
                       v, s->dev_state);
+
+        /* CMD_TX_VALID (0x0100): driver signals a TPL is ready to transmit */
+        if (v & 0x0100) {
+            tms380_process_tx(s);
+        }
 
         /* EXEC_SOFT_RESET: the driver sends 0xFF80 (or similar high-byte-set
          * command) after firmware download to start BUD. Match any write with
