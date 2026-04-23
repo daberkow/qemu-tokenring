@@ -405,9 +405,12 @@ static void tms380_rx_poll(void *opaque)
     uint16_t status = rpl[4] | (rpl[5] << 8);
     if (!(status & RX_VALID)) return;  /* RPL not ready */
 
-    /* Get data buffer DMA address (BE u32) */
-    uint32_t data_addr = ((uint32_t)rpl[10] << 24) | ((uint32_t)rpl[11] << 16) |
-                         ((uint32_t)rpl[12] << 8) | rpl[13];
+    /* Get data buffer DMA address.
+     * FragList.DataAddr is __be32, written as htonl(dma_addr).
+     * Reading the raw 4 bytes as-is gives the byte-swapped value.
+     * Use ntohl (= read as LE u32) to get the original DMA address. */
+    uint32_t data_addr = rpl[10] | ((uint32_t)rpl[11] << 8) |
+                         ((uint32_t)rpl[12] << 16) | ((uint32_t)rpl[13] << 24);
     if (!data_addr) return;
 
     qemu_log_mask(LOG_GUEST_ERROR, "tms380: RX: %d bytes → DMA 0x%08x\n", n, data_addr);
@@ -428,9 +431,8 @@ static void tms380_rx_poll(void *opaque)
                     ((uint32_t)rpl[2] << 8) | rpl[3];
     if (!(next & 1) && next) s->rpl_addr = next;
 
-    /* DEBUG: skip interrupt — test if DMA+RPL update alone is safe */
-    /* tms380_write_ssb(s, OC_RECEIVE, GOOD_COMPLETION);
-    tms380_raise_irq(s, STS_IRQ_RECEIVE_STATUS); */
+    tms380_write_ssb(s, OC_RECEIVE, GOOD_COMPLETION);
+    tms380_raise_irq(s, STS_IRQ_RECEIVE_STATUS);
 }
 
 /* --- TX processing --- */
