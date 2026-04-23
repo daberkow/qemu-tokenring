@@ -38,6 +38,21 @@
 static void tms380_write_ssb(TMS380PCIState *s, uint16_t sts, uint16_t parm0);
 static void tms380_raise_irq(TMS380PCIState *s, uint16_t irq_type);
 
+/* Deferred SCB_CLEAR interrupt */
+static void tms380_scb_clear_cb(void *opaque)
+{
+    TMS380PCIState *s = opaque;
+    tms380_raise_irq(s, STS_IRQ_SCB_CLEAR);
+}
+
+/* Deferred COMMAND_STATUS interrupt — used for OPEN to allow driver
+ * to reach interruptible_sleep_on() before we fire the wake_up */
+static void tms380_cmd_status_cb(void *opaque)
+{
+    TMS380PCIState *s = opaque;
+    tms380_raise_irq(s, STS_IRQ_COMMAND_STATUS);
+}
+
 /* --- DIO (Direct I/O) helpers --- */
 
 /* Read a 16-bit word from adapter SRAM at the current DIO address */
@@ -539,7 +554,6 @@ static void tms380_handle_command(TMS380PCIState *s, uint16_t cmd,
             s->backend = s->fn_raw_create(s->mau_path, s->mac);
             if (s->backend) {
                 s->dev_state = TMS_STATE_OPEN;
-                /* Start RX polling timer */
                 timer_mod(s->rx_timer,
                           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 10 * SCALE_MS);
                 qemu_log_mask(LOG_GUEST_ERROR, "tms380: OPEN success (raw backend)\n");
@@ -553,8 +567,13 @@ static void tms380_handle_command(TMS380PCIState *s, uint16_t cmd,
             s->dev_state = TMS_STATE_OPEN;
             qemu_log_mask(LOG_GUEST_ERROR, "tms380: OPEN (stub)\n");
         }
+        /* Defer the OPEN completion interrupt. The driver sets tp->Sleeping=1
+         * and calls interruptible_sleep_on() AFTER exec_sifcmd returns.
+         * If we fire the interrupt synchronously, the wake_up happens before
+         * the sleep, and the driver hangs forever. Delay by 100ms. */
         tms380_write_ssb(s, cmd, GOOD_COMPLETION);
-        tms380_raise_irq(s, STS_IRQ_COMMAND_STATUS);
+        timer_mod(s->cmd_status_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100 * SCALE_MS);
         break;
 
     case OC_CLOSE:
@@ -716,14 +735,18 @@ static void tms380_io_write(void *opaque, hwaddr addr, uint64_t val,
             }
         }
 
-        /* Clear system interrupt when the driver writes the low byte (ACK).
-         * The driver writes CMD_SSB_CLEAR | CMD_INTERRUPT_ADAPTER (0xA0XX)
-         * to acknowledge a command completion interrupt.
-         * CMD_SSB_CLEAR = 0x2000, CMD_INTERRUPT_ADAPTER = 0x8000.
-         * We clear the IRQ whenever CMD_SSB_CLEAR is set. */
+        /* When the driver acks with CMD_SSB_CLEAR, clear the current IRQ.
+         * If the previous IRQ was a COMMAND_STATUS (not SCB_CLEAR itself),
+         * schedule a deferred SCB_CLEAR to unblock the command queue. */
         if (v & CMD_SSB_CLEAR) {
+            uint16_t prev_irq = s->sifsts & STS_IRQ_MASK;
             pci_irq_deassert(&s->parent_obj);
             s->sifsts &= ~(STS_IRQ_MASK | 0x0080);
+            /* Only fire SCB_CLEAR after a real command, not after SCB_CLEAR itself */
+            if (prev_irq == STS_IRQ_COMMAND_STATUS) {
+                timer_mod(s->scb_clear_timer,
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100 * SCALE_US);
+            }
         }
         /* Also clear on any low-byte write without CMD_INTERRUPT_ADAPTER */
         else if ((v & 0x00FF) && !(v & CMD_INTERRUPT_ADAPTER)) {
@@ -792,6 +815,10 @@ static void tms380_pci_realize(PCIDevice *pci_dev, Error **errp)
     /* Create timers */
     s->reset_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tms380_bud_done, s);
     s->rx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tms380_rx_poll, s);
+    /* Use REALTIME for deferred interrupts — VIRTUAL doesn't advance when
+     * the vCPU is halted (e.g., in interruptible_sleep_on). */
+    s->scb_clear_timer = timer_new_ns(QEMU_CLOCK_REALTIME, tms380_scb_clear_cb, s);
+    s->cmd_status_timer = timer_new_ns(QEMU_CLOCK_REALTIME, tms380_cmd_status_cb, s);
 
     /* Load backend if configured */
     tms380_load_backend(s);
