@@ -81,7 +81,7 @@ typedef enum {
 } TMS380DevState;
 
 /* Adapter RAM size for DIO access */
-#define TMS380_SRAM_SIZE    (64 * 1024)  /* 64KB adapter RAM */
+#define TMS380_SRAM_SIZE    (128 * 1024)  /* 128KB adapter RAM (two pages) */
 
 /* I/O BAR size: 32 bytes (tmspci driver requests TMS_PCI_IO_EXTENT = 32) */
 #define TMS380_IO_SIZE      32

@@ -11,6 +11,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/pci/pci_device.h"
+#include "hw/pci/pci.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/irq.h"
 #include "migration/vmstate.h"
@@ -18,6 +19,7 @@
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "qemu/log.h"
+#include "exec/cpu-common.h"
 #include "tms380.h"
 #include <dlfcn.h>
 
@@ -128,22 +130,105 @@ static void tms380_do_reset(TMS380PCIState *s)
 
 /* Called when driver sends EXEC_SOFT_RESET (0xFF00) to SIFCMD.
  * This happens after firmware download and CPHALT clear.
- * Start BUD and set STS_INITIALIZE after a short delay. */
+ * Transition directly to BUD complete — the driver polls SIFSTS
+ * in a tight loop and with KVM it's too fast for a timer. */
 static void tms380_soft_reset(TMS380PCIState *s)
 {
-    qemu_log_mask(LOG_GUEST_ERROR, "tms380: soft reset, starting BUD\n");
-    s->sifsts = STS_TEST;  /* Test in progress briefly */
-    /* BUD completes quickly — use a timer so the driver's poll loop works */
-    timer_mod(s->reset_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1 * SCALE_MS);
+    qemu_log_mask(LOG_GUEST_ERROR, "tms380: soft reset → BUD complete\n");
+    s->dev_state = TMS_STATE_BUD;
+    s->sifsts = STS_INITIALIZE;
 }
+
+/* SCB and SSB test patterns that the driver checks after init.
+ * The adapter must DMA-write these to the host's SCB/SSB buffers
+ * to prove DMA is working. */
+static const uint8_t SCB_Test[6] = {0x00, 0x00, 0xC1, 0xE2, 0xD4, 0x8B};
+static const uint8_t SSB_Test[8] = {0xFF, 0xFF, 0xD1, 0xD7, 0xC5, 0xD9, 0xC3, 0xD4};
 
 /* Handle the initialization command (after driver writes IPB and sends CMD_EXECUTE) */
 static void tms380_handle_init(TMS380PCIState *s)
 {
-    /* The driver wrote an IPB (Initialization Parameter Block) to SRAM.
-     * We don't need to parse most of it — just transition to READY.
-     * Clear all status bits to signal init complete. */
+    /* The driver wrote an 11-word IPB to our SRAM at page 1, offset 0x0A00.
+     * Words 7-8 = SCB DMA address (word-swapped: high word first)
+     * Words 9-10 = SSB DMA address (word-swapped: high word first)
+     *
+     * After we clear the init status bits, the driver checks that we
+     * DMA-wrote the SCB_Test and SSB_Test patterns to those host addresses.
+     * We use pci_dma_write to write from our device to guest physical memory. */
+
+    /* IPB is at page 1 (0x10000) + offset 0x0A00 in our SRAM */
+    uint32_t ipb_base = 0x10000 + 0x0A00;
+
+    /* Read SCB address from IPB words 7-8 (byte offsets 14-17).
+     * The driver stores SWAPW(dma_addr): on LE x86, the first word written
+     * (word7) is the LOW 16 bits of the swapped value, which is the HIGH
+     * 16 bits of the original address. So: addr = (word7 << 16) | word8 */
+    uint16_t scb_w7 = (s->sram[ipb_base + 14] << 8) | s->sram[ipb_base + 15];
+    uint16_t scb_w8 = (s->sram[ipb_base + 16] << 8) | s->sram[ipb_base + 17];
+    uint32_t scb_addr = ((uint32_t)scb_w7 << 16) | scb_w8;
+
+    /* Read SSB address from IPB words 9-10 (byte offsets 18-21) */
+    uint16_t ssb_w9 = (s->sram[ipb_base + 18] << 8) | s->sram[ipb_base + 19];
+    uint16_t ssb_w10 = (s->sram[ipb_base + 20] << 8) | s->sram[ipb_base + 21];
+    uint32_t ssb_addr = ((uint32_t)ssb_w9 << 16) | ssb_w10;
+
+    /* Dump full 22-byte IPB for debugging */
+    qemu_log_mask(LOG_GUEST_ERROR, "tms380: init: IPB dump (22 bytes):\n");
+    for (int i = 0; i < 22; i += 2) {
+        qemu_log_mask(LOG_GUEST_ERROR, "  word%d: %02x %02x\n",
+                      i/2, s->sram[ipb_base+i], s->sram[ipb_base+i+1]);
+    }
+    /* Log all possible address interpretations to find the right one */
+    uint8_t *b = &s->sram[ipb_base + 14];
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "tms380: SCB raw bytes: %02x %02x %02x %02x\n",
+                  b[0], b[1], b[2], b[3]);
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "tms380: SCB interpretations:\n"
+                  "  BE32: 0x%02x%02x%02x%02x\n"
+                  "  LE32: 0x%02x%02x%02x%02x\n"
+                  "  (w7<<16)|w8: 0x%08x\n"
+                  "  (w8<<16)|w7: 0x%08x\n",
+                  b[0], b[1], b[2], b[3],
+                  b[3], b[2], b[1], b[0],
+                  scb_addr,
+                  ((uint32_t)scb_w8 << 16) | scb_w7);
+
+    /* Save addresses for later SRB command handling */
+    s->scb_addr = scb_addr;
+    s->ssb_addr = ssb_addr;
+
+    /* Force-enable bus mastering for DMA. The tmspci driver doesn't call
+     * pci_set_master() but we need DMA for SCB/SSB test patterns.
+     * Use pci_set_word to properly update QEMU's internal state. */
+    {
+        uint16_t cmd = pci_get_word(s->parent_obj.config + PCI_COMMAND);
+        pci_set_word(s->parent_obj.config + PCI_COMMAND, cmd | PCI_COMMAND_MASTER);
+        qemu_log_mask(LOG_GUEST_ERROR, "tms380: PCI_COMMAND: 0x%04x → 0x%04x\n",
+                      cmd, pci_get_word(s->parent_obj.config + PCI_COMMAND));
+    }
+
+    /* Write test patterns directly to guest physical memory.
+     * The driver checks these to verify DMA is working. */
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "tms380: writing SCB test pattern to phys 0x%08x\n", scb_addr);
+    cpu_physical_memory_write(scb_addr, SCB_Test, sizeof(SCB_Test));
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "tms380: writing SSB test pattern to phys 0x%08x\n", ssb_addr);
+    cpu_physical_memory_write(ssb_addr, SSB_Test, sizeof(SSB_Test));
+
+    /* Verify SCB write */
+    {
+        uint8_t verify[6] = {0};
+        cpu_physical_memory_read(scb_addr, verify, sizeof(verify));
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "tms380: SCB verify: %02x %02x %02x %02x %02x %02x\n",
+                      verify[0], verify[1], verify[2], verify[3],
+                      verify[4], verify[5]);
+    }
+
+    /* Clear all status bits to signal init complete */
     s->sifsts = 0;
     s->dev_state = TMS_STATE_READY;
     qemu_log_mask(LOG_GUEST_ERROR, "tms380: initialization complete, ready\n");
@@ -229,6 +314,10 @@ static uint64_t tms380_io_read(void *opaque, hwaddr addr, unsigned size)
 
     case SIF_INC:   /* 0x02 — read SRAM + auto-increment */
         val = dio_read16_inc(s);
+        if (s->dev_state >= TMS_STATE_READY) {
+            qemu_log_mask(LOG_GUEST_ERROR, "tms380: SIFINC read=0x%04x addr=0x%04x page=0x%04x\n",
+                          val, (uint16_t)(s->dio_addr - 2), s->dio_page);
+        }
         break;
 
     case SIF_ADR:   /* 0x04 — current DIO address */
@@ -237,6 +326,8 @@ static uint64_t tms380_io_read(void *opaque, hwaddr addr, unsigned size)
 
     case SIF_CMD:   /* 0x06 — read returns status register */
         val = s->sifsts;
+        qemu_log_mask(LOG_GUEST_ERROR, "tms380: SIFSTS read 0x%04x state=%d\n",
+                      val, s->dev_state);
         break;
 
     case SIF_ACL:   /* 0x08 — adapter control */
@@ -279,23 +370,28 @@ static void tms380_io_write(void *opaque, hwaddr addr, uint64_t val,
 
     case SIF_ADR:   /* 0x04 — set DIO address */
         s->dio_addr = v;
+        qemu_log_mask(LOG_GUEST_ERROR, "tms380: SIFADR=0x%04x (page=0x%04x)\n",
+                      v, s->dio_page);
         break;
 
     case SIF_CMD:   /* 0x06 — command register */
         s->sifcmd = v;
+        qemu_log_mask(LOG_GUEST_ERROR, "tms380: SIFCMD write 0x%04x state=%d\n",
+                      v, s->dev_state);
 
-        /* EXEC_SOFT_RESET = 0xFF00: driver sends this after firmware download
-         * to start BUD (Bring Up Diagnostics). */
-        if (v == 0xFF00 && s->dev_state == TMS_STATE_RESET) {
+        /* EXEC_SOFT_RESET: the driver sends 0xFF80 (or similar high-byte-set
+         * command) after firmware download to start BUD. Match any write with
+         * the high byte = 0xFF while in RESET state. */
+        if ((v & 0xFF00) == 0xFF00 && s->dev_state == TMS_STATE_RESET) {
             tms380_soft_reset(s);
             break;
         }
 
         /* Handle command bits */
-        if (v & CMD_EXECUTE) {
+        if (v & (CMD_EXECUTE | CMD_INTERRUPT_ADAPTER)) {
             if (s->dev_state == TMS_STATE_BUD &&
                 (s->sifsts & STS_INITIALIZE)) {
-                /* BUD done, driver wrote IPB and sent CMD_EXECUTE — init */
+                /* BUD done, driver wrote IPB and sent init command — complete init */
                 tms380_handle_init(s);
             } else if (s->dev_state == TMS_STATE_READY ||
                        s->dev_state == TMS_STATE_OPEN) {
@@ -326,6 +422,7 @@ static void tms380_io_write(void *opaque, hwaddr addr, uint64_t val,
 
     case SIF_ADX:   /* 0x0c — DIO page/extended address */
         s->dio_page = v;
+        qemu_log_mask(LOG_GUEST_ERROR, "tms380: SIFADX=0x%04x\n", v);
         break;
 
     case SIF_DMALEN: /* 0x0e — DMA length (ignored) */
@@ -341,7 +438,7 @@ static const MemoryRegionOps tms380_io_ops = {
     .write = tms380_io_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .impl = {
-        .min_access_size = 1,
+        .min_access_size = 2,
         .max_access_size = 2,
     },
 };
@@ -354,6 +451,12 @@ static void tms380_pci_realize(PCIDevice *pci_dev, Error **errp)
 
     /* Set PCI interrupt pin A */
     pci_dev->config[PCI_INTERRUPT_PIN] = 1;
+
+    /* The tmspci driver doesn't call pci_set_master(), but we need bus
+     * mastering for DMA. Set it as a default so the guest can use it.
+     * Use wmask to allow the guest to control it if it wants to. */
+    pci_dev->config[PCI_COMMAND] = PCI_COMMAND_MASTER;
+    pci_dev->wmask[PCI_COMMAND] |= PCI_COMMAND_MASTER;
 
     /* Allocate adapter SRAM */
     s->sram = g_malloc0(TMS380_SRAM_SIZE);
