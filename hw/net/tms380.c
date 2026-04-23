@@ -294,7 +294,8 @@ static void tms380_raise_irq(TMS380PCIState *s, uint16_t irq_type)
     pci_irq_assert(&s->parent_obj);
 }
 
-static void tms380_handle_srb(TMS380PCIState *s, uint8_t *srb, uint32_t srb_phys);
+static void tms380_handle_command(TMS380PCIState *s, uint16_t cmd,
+                                  uint8_t *parm, uint32_t parm_phys);
 
 /* Read SCB from host memory and dispatch the command */
 static void tms380_handle_scb(TMS380PCIState *s)
@@ -306,18 +307,14 @@ static void tms380_handle_scb(TMS380PCIState *s)
                   "tms380: SCB at phys 0x%08x: %02x %02x %02x %02x %02x %02x\n",
                   s->scb_addr, scb[0], scb[1], scb[2], scb[3], scb[4], scb[5]);
 
-    /* The SCB struct is packed big-endian on the TMS380:
-     *   u16 CMD
-     *   u16 Parm[0]  (high word of 32-bit address)
-     *   u16 Parm[1]  (low word of 32-bit address)
-     * But the driver writes to host memory in native (LE) byte order,
-     * using cpu_to_be16() for each field. So the bytes in memory are BE. */
-    uint16_t cmd = (scb[0] << 8) | scb[1];
-    /* The Parm is SWAPW'd: Parm[0]=low16, Parm[1]=high16 of the address.
-     * Same SWAPW convention as IPB addresses. */
-    uint16_t parm_w0 = (scb[2] << 8) | scb[3];
-    uint16_t parm_w1 = (scb[4] << 8) | scb[5];
-    uint32_t parm_addr = ((uint32_t)parm_w0 << 16) | parm_w1;
+    /* The SCB is in host memory in native (LE) byte order.
+     * The driver writes: tp->scb.CMD = OPEN (0x0300) etc.
+     * On LE x86, u16 0x0300 stores as {0x00, 0x03}. */
+    uint16_t cmd = scb[0] | (scb[1] << 8);  /* LE u16 */
+    uint16_t parm_w0 = scb[2] | (scb[3] << 8);  /* LE u16 Parm[0] = LOWORD */
+    uint16_t parm_w1 = scb[4] | (scb[5] << 8);  /* LE u16 Parm[1] = HIWORD */
+    /* Parm is SWAPW'd: Parm[0]=low16, Parm[1]=high16 of physical address */
+    uint32_t parm_addr = ((uint32_t)parm_w1 << 16) | parm_w0;
 
     qemu_log_mask(LOG_GUEST_ERROR,
                   "tms380: SCB cmd=0x%04x parm=0x%08x (w0=0x%04x w1=0x%04x)\n",
@@ -334,91 +331,112 @@ static void tms380_handle_scb(TMS380PCIState *s)
                       srb[4], srb[5], srb[6], srb[7]);
     }
 
-    /* The SCB CMD field is the actual command code (e.g., 0x0003 = OPEN).
-     * The Parm points to the command's parameter block (e.g., OPB for OPEN).
-     * Override srb[0] with the SCB command code for our SRB handler. */
-    srb[0] = cmd & 0xFF;
-    tms380_handle_srb(s, srb, parm_addr);
+    /* Dispatch based on SCB operation code */
+    tms380_handle_command(s, cmd, srb, parm_addr);
 }
 
-static void tms380_handle_srb(TMS380PCIState *s, uint8_t *srb, uint32_t srb_phys)
-{
-    uint8_t cmd = srb[0];
+/* SCB Operation Codes (from tms380tr.h) */
+#define OC_OPEN             0x0300
+#define OC_TRANSMIT         0x0400
+#define OC_TRANSMIT_HALT    0x0500
+#define OC_RECEIVE          0x0600
+#define OC_CLOSE            0x0700
+#define OC_SET_GROUP_ADDR   0x0800
+#define OC_SET_FUNCT_ADDR   0x0900
+#define OC_READ_ERROR_LOG   0x0A00
 
-    qemu_log_mask(LOG_GUEST_ERROR, "tms380: SRB cmd=0x%02x at phys 0x%08x\n",
-                  cmd, srb_phys);
+/* GOOD_COMPLETION status for SSB */
+#define GOOD_COMPLETION     0x0080
+
+static void tms380_write_ssb(TMS380PCIState *s, uint16_t sts, uint16_t parm0)
+{
+    /* SSB in host memory, native LE byte order */
+    uint8_t ssb[8] = {0};
+    ssb[0] = sts & 0xFF;         /* LE low byte */
+    ssb[1] = (sts >> 8) & 0xFF;  /* LE high byte */
+    ssb[2] = parm0 & 0xFF;
+    ssb[3] = (parm0 >> 8) & 0xFF;
+    cpu_physical_memory_write(s->ssb_addr, ssb, 8);
+}
+
+static void tms380_handle_command(TMS380PCIState *s, uint16_t cmd,
+                                  uint8_t *parm, uint32_t parm_phys)
+{
+    qemu_log_mask(LOG_GUEST_ERROR, "tms380: CMD 0x%04x parm_phys=0x%08x\n",
+                  cmd, parm_phys);
 
     switch (cmd) {
-    case SRB_CMD_OPEN:
+    case OC_OPEN:
         if (s->fn_create && s->mau_path && s->mau_path[0]) {
             s->backend = s->fn_create(s->mau_path, s->mac);
             if (s->backend && s->fn_insert(s->backend) == 0) {
                 s->dev_state = TMS_STATE_OPEN;
-                srb[2] = 0x00;
-                qemu_log_mask(LOG_GUEST_ERROR, "tms380: OPEN success\n");
+                qemu_log_mask(LOG_GUEST_ERROR, "tms380: OPEN success (backend)\n");
             } else {
                 if (s->backend) {
                     s->fn_destroy(s->backend);
                     s->backend = NULL;
                 }
-                srb[2] = 0x07;
-                qemu_log_mask(LOG_GUEST_ERROR, "tms380: OPEN failed\n");
+                qemu_log_mask(LOG_GUEST_ERROR, "tms380: OPEN failed (backend)\n");
+                tms380_write_ssb(s, cmd, 0);
+                tms380_raise_irq(s, STS_IRQ_COMMAND_STATUS);
+                return;
             }
         } else {
             s->dev_state = TMS_STATE_OPEN;
-            srb[2] = 0x00;
             qemu_log_mask(LOG_GUEST_ERROR, "tms380: OPEN (stub)\n");
         }
+        tms380_write_ssb(s, cmd, GOOD_COMPLETION);
+        tms380_raise_irq(s, STS_IRQ_COMMAND_STATUS);
         break;
 
-    case SRB_CMD_CLOSE:
+    case OC_CLOSE:
         if (s->backend && s->fn_destroy) {
             s->fn_destroy(s->backend);
             s->backend = NULL;
         }
         s->dev_state = TMS_STATE_READY;
-        srb[2] = 0x00;
         qemu_log_mask(LOG_GUEST_ERROR, "tms380: CLOSE\n");
+        tms380_write_ssb(s, cmd, GOOD_COMPLETION);
+        tms380_raise_irq(s, STS_IRQ_COMMAND_STATUS);
         break;
 
-    case SRB_CMD_SET_FUNCT_ADDR:
-    case SRB_CMD_SET_GROUP_ADDR:
-    case SRB_CMD_READ_ERROR_LOG:
-        srb[2] = 0x00;
-        qemu_log_mask(LOG_GUEST_ERROR, "tms380: SRB 0x%02x (stub OK)\n", cmd);
+    case OC_TRANSMIT:
+        /* The Parm points to the TPL (Transmit Parameter List) in host memory.
+         * For now, just acknowledge. TX data path comes next. */
+        qemu_log_mask(LOG_GUEST_ERROR, "tms380: TRANSMIT (stub)\n");
+        tms380_write_ssb(s, cmd, GOOD_COMPLETION);
+        tms380_raise_irq(s, STS_IRQ_COMMAND_STATUS);
+        break;
+
+    case OC_TRANSMIT_HALT:
+        qemu_log_mask(LOG_GUEST_ERROR, "tms380: TRANSMIT_HALT\n");
+        tms380_write_ssb(s, cmd, GOOD_COMPLETION);
+        tms380_raise_irq(s, STS_IRQ_COMMAND_STATUS);
+        break;
+
+    case OC_RECEIVE:
+        /* The Parm points to the RPL (Receive Parameter List) in host memory.
+         * For now, just acknowledge. RX data path comes next. */
+        qemu_log_mask(LOG_GUEST_ERROR, "tms380: RECEIVE (stub)\n");
+        tms380_write_ssb(s, cmd, GOOD_COMPLETION);
+        tms380_raise_irq(s, STS_IRQ_COMMAND_STATUS);
+        break;
+
+    case OC_SET_FUNCT_ADDR:
+    case OC_SET_GROUP_ADDR:
+    case OC_READ_ERROR_LOG:
+        qemu_log_mask(LOG_GUEST_ERROR, "tms380: CMD 0x%04x (stub OK)\n", cmd);
+        tms380_write_ssb(s, cmd, GOOD_COMPLETION);
+        tms380_raise_irq(s, STS_IRQ_COMMAND_STATUS);
         break;
 
     default:
-        qemu_log_mask(LOG_GUEST_ERROR, "tms380: unknown SRB 0x%02x\n", cmd);
-        srb[2] = 0x04;
+        qemu_log_mask(LOG_GUEST_ERROR, "tms380: unknown CMD 0x%04x\n", cmd);
+        tms380_write_ssb(s, cmd, 0);
+        tms380_raise_irq(s, STS_IRQ_COMMAND_STATUS);
         break;
     }
-
-    /* Write SRB result back to host memory */
-    if (srb_phys) {
-        cpu_physical_memory_write(srb_phys, srb, 32);
-    }
-
-    /* Write SSB completion to host memory.
-     * SSB is big-endian: {u16 STS, u16 Parm[0], u16 Parm[1], u16 Parm[2]}
-     * STS = command code (e.g., 0x0300 for OPEN)
-     * Parm[0] = status (0x0080 = GOOD_COMPLETION for OPEN) */
-    {
-        uint8_t ssb[8] = {0};
-        ssb[0] = 0x00;  /* STS high byte */
-        ssb[1] = cmd;   /* STS low byte = command code */
-        /* Wait — the driver reads ssb_cmd = tp->ssb.STS which is u16.
-         * OPEN = 0x0300. In BE memory: byte0=0x03, byte1=0x00. */
-        /* SSB is in host memory on LE x86. The driver reads fields as native u16.
-         * STS = OPEN (0x0300): LE bytes = {0x00, 0x03}
-         * Parm[0] = GOOD_COMPLETION (0x0080): LE bytes = {0x80, 0x00} */
-        ssb[0] = 0x00; ssb[1] = cmd;   /* STS = 0x0300 for OPEN (LE) */
-        ssb[2] = 0x80; ssb[3] = 0x00;  /* Parm[0] = GOOD_COMPLETION (LE) */
-        cpu_physical_memory_write(s->ssb_addr, ssb, 8);
-    }
-
-    /* Raise command completion interrupt */
-    tms380_raise_irq(s, STS_IRQ_COMMAND_STATUS);
 }
 
 /* --- SIF register I/O --- */
