@@ -127,12 +127,12 @@ struct TMS380PCIState {
     char *mau_path;
     char *backend_lib_path;
 
-    void *(*fn_create)(const char *mau_path, const uint8_t *mac);
-    int (*fn_insert)(void *backend);
-    int (*fn_send)(void *backend, const uint8_t *dst, const uint8_t *data, uint32_t len);
-    int (*fn_get_recv_fd)(void *backend);
-    int (*fn_recv)(void *backend, uint8_t *src_mac, uint8_t *buf, uint32_t buf_len);
-    void (*fn_destroy)(void *backend);
+    /* Raw backend function pointers (tr_raw_* from libtr_backend.so) */
+    void *(*fn_raw_create)(const char *mau_path, const uint8_t *mac);
+    int (*fn_raw_send)(void *backend, const uint8_t *data, uint32_t len);
+    int (*fn_raw_get_recv_fd)(void *backend);
+    int (*fn_raw_recv)(void *backend, uint8_t *buf, uint32_t buf_len);
+    void (*fn_raw_destroy)(void *backend);
 };
 
 #endif /* HW_NET_TMS380_H */

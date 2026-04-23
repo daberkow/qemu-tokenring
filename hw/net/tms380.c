@@ -75,15 +75,14 @@ static bool tms380_load_backend(TMS380PCIState *s)
         return false;
     }
 
-    s->fn_create = dlsym(s->backend_lib, "tr_backend_create");
-    s->fn_insert = dlsym(s->backend_lib, "tr_backend_insert");
-    s->fn_send = dlsym(s->backend_lib, "tr_backend_send");
-    s->fn_get_recv_fd = dlsym(s->backend_lib, "tr_backend_get_recv_fd");
-    s->fn_recv = dlsym(s->backend_lib, "tr_backend_recv");
-    s->fn_destroy = dlsym(s->backend_lib, "tr_backend_destroy");
+    s->fn_raw_create = dlsym(s->backend_lib, "tr_raw_create");
+    s->fn_raw_send = dlsym(s->backend_lib, "tr_raw_send");
+    s->fn_raw_get_recv_fd = dlsym(s->backend_lib, "tr_raw_get_recv_fd");
+    s->fn_raw_recv = dlsym(s->backend_lib, "tr_raw_recv");
+    s->fn_raw_destroy = dlsym(s->backend_lib, "tr_raw_destroy");
 
-    if (!s->fn_create || !s->fn_insert || !s->fn_send ||
-        !s->fn_get_recv_fd || !s->fn_recv || !s->fn_destroy) {
+    if (!s->fn_raw_create || !s->fn_raw_send ||
+        !s->fn_raw_get_recv_fd || !s->fn_raw_recv || !s->fn_raw_destroy) {
         qemu_log_mask(LOG_GUEST_ERROR, "tms380: missing symbols in %s\n",
                       s->backend_lib_path);
         dlclose(s->backend_lib);
@@ -398,15 +397,10 @@ static void tms380_process_tx(TMS380PCIState *s)
     uint8_t *frame = g_malloc(data_count);
     cpu_physical_memory_read(data_addr, frame, data_count);
 
-    /* Send via backend if available */
-    if (s->backend && s->fn_send && data_count > 14) {
-        /* Frame starts with AC(1) + FC(1) + DA(6) + SA(6) + payload
-         * Extract DA for tr_backend_send */
-        uint8_t *dst_mac = &frame[2]; /* DA at offset 2 */
-        uint8_t *payload = &frame[14]; /* Payload after header */
-        uint16_t payload_len = data_count - 14;
-        s->fn_send(s->backend, dst_mac, payload, payload_len);
-        qemu_log_mask(LOG_GUEST_ERROR, "tms380: TX: sent %d bytes via backend\n",
+    /* Send raw frame via backend — the guest driver built the full 802.5 frame */
+    if (s->backend && s->fn_raw_send) {
+        s->fn_raw_send(s->backend, frame, data_count);
+        qemu_log_mask(LOG_GUEST_ERROR, "tms380: TX: sent %d bytes via raw backend\n",
                       data_count);
     } else {
         qemu_log_mask(LOG_GUEST_ERROR, "tms380: TX: %d bytes (no backend)\n",
@@ -446,17 +440,13 @@ static void tms380_handle_command(TMS380PCIState *s, uint16_t cmd,
 
     switch (cmd) {
     case OC_OPEN:
-        if (s->fn_create && s->mau_path && s->mau_path[0]) {
-            s->backend = s->fn_create(s->mau_path, s->mac);
-            if (s->backend && s->fn_insert(s->backend) == 0) {
+        if (s->fn_raw_create && s->mau_path && s->mau_path[0]) {
+            s->backend = s->fn_raw_create(s->mau_path, s->mac);
+            if (s->backend) {
                 s->dev_state = TMS_STATE_OPEN;
-                qemu_log_mask(LOG_GUEST_ERROR, "tms380: OPEN success (backend)\n");
+                qemu_log_mask(LOG_GUEST_ERROR, "tms380: OPEN success (raw backend)\n");
             } else {
-                if (s->backend) {
-                    s->fn_destroy(s->backend);
-                    s->backend = NULL;
-                }
-                qemu_log_mask(LOG_GUEST_ERROR, "tms380: OPEN failed (backend)\n");
+                qemu_log_mask(LOG_GUEST_ERROR, "tms380: OPEN failed (raw backend)\n");
                 tms380_write_ssb(s, cmd, 0);
                 tms380_raise_irq(s, STS_IRQ_COMMAND_STATUS);
                 return;
@@ -470,8 +460,8 @@ static void tms380_handle_command(TMS380PCIState *s, uint16_t cmd,
         break;
 
     case OC_CLOSE:
-        if (s->backend && s->fn_destroy) {
-            s->fn_destroy(s->backend);
+        if (s->backend && s->fn_raw_destroy) {
+            s->fn_raw_destroy(s->backend);
             s->backend = NULL;
         }
         s->dev_state = TMS_STATE_READY;
@@ -722,8 +712,8 @@ static void tms380_pci_exit(PCIDevice *pci_dev)
 
     timer_free(s->reset_timer);
 
-    if (s->backend && s->fn_destroy) {
-        s->fn_destroy(s->backend);
+    if (s->backend && s->fn_raw_destroy) {
+        s->fn_raw_destroy(s->backend);
         s->backend = NULL;
     }
     if (s->backend_lib) {
