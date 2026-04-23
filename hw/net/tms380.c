@@ -437,6 +437,8 @@ static void tms380_rx_poll(void *opaque)
                     ((uint32_t)rpl[2] << 8) | rpl[3];
     if (!(next & 1) && next) s->rpl_addr = next;
 
+    /* Write SSB with RECEIVE status and raise interrupt.
+     * The driver's chk_ssb checks ssb.STS != 0xFFFF for RECEIVE. */
     tms380_write_ssb(s, OC_RECEIVE, GOOD_COMPLETION);
     tms380_raise_irq(s, STS_IRQ_RECEIVE_STATUS);
 }
@@ -519,11 +521,18 @@ static void tms380_write_ssb(TMS380PCIState *s, uint16_t sts, uint16_t parm0)
 {
     /* SSB in host memory, native LE byte order */
     uint8_t ssb[8] = {0};
-    ssb[0] = sts & 0xFF;         /* LE low byte */
-    ssb[1] = (sts >> 8) & 0xFF;  /* LE high byte */
+    ssb[0] = sts & 0xFF;
+    ssb[1] = (sts >> 8) & 0xFF;
     ssb[2] = parm0 & 0xFF;
     ssb[3] = (parm0 >> 8) & 0xFF;
     cpu_physical_memory_write(s->ssb_addr, ssb, 8);
+
+    /* Verify */
+    uint8_t check[8];
+    cpu_physical_memory_read(s->ssb_addr, check, 8);
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "tms380: SSB write to 0x%08x: sts=0x%04x parm0=0x%04x verify=%02x%02x%02x%02x\n",
+                  s->ssb_addr, sts, parm0, check[0], check[1], check[2], check[3]);
 }
 
 static void tms380_handle_command(TMS380PCIState *s, uint16_t cmd,
