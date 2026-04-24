@@ -1,0 +1,33 @@
+name: Build TMS380 Device
+
+on:
+  push:
+    branches: [tms380-dev]
+  pull_request:
+    branches: [tms380-dev]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential ninja-build pkg-config \
+            libglib2.0-dev libpixman-1-dev libslirp-dev \
+            python3-venv
+
+      - name: Configure QEMU
+        run: |
+          mkdir build && cd build
+          ../configure \
+            --target-list=x86_64-softmmu \
+            --enable-slirp
+
+      - name: Build
+        run: make -C build -j$(nproc)
