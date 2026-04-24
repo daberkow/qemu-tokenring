@@ -524,6 +524,29 @@ static void tms380_process_tx(TMS380PCIState *s)
     tpl[5] = (done_status >> 8) & 0xFF;
     cpu_physical_memory_write(s->tpl_addr + 4, &tpl[4], 2);
 
+    /* HACK: read BusyFlag from known offset to verify it's set.
+     * TPL struct on x86_64: 62 bytes packed + 2 pad + 8+8+8+4+pad+8+1 = varies
+     * Try dumping a range to find BusyFlag */
+    {
+        uint8_t tpl_dump[120];
+        cpu_physical_memory_read(s->tpl_addr, tpl_dump, 120);
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "tms380: TX: TPL[60-100]: %02x %02x %02x %02x %02x %02x %02x %02x "
+                      "%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x "
+                      "%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x "
+                      "%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                      tpl_dump[60], tpl_dump[61], tpl_dump[62], tpl_dump[63],
+                      tpl_dump[64], tpl_dump[65], tpl_dump[66], tpl_dump[67],
+                      tpl_dump[68], tpl_dump[69], tpl_dump[70], tpl_dump[71],
+                      tpl_dump[72], tpl_dump[73], tpl_dump[74], tpl_dump[75],
+                      tpl_dump[76], tpl_dump[77], tpl_dump[78], tpl_dump[79],
+                      tpl_dump[80], tpl_dump[81], tpl_dump[82], tpl_dump[83],
+                      tpl_dump[84], tpl_dump[85], tpl_dump[86], tpl_dump[87],
+                      tpl_dump[88], tpl_dump[89], tpl_dump[90], tpl_dump[91],
+                      tpl_dump[92], tpl_dump[93], tpl_dump[94], tpl_dump[95],
+                      tpl_dump[96], tpl_dump[97], tpl_dump[98], tpl_dump[99]);
+    }
+
     /* Write SSB for transmit completion */
     tms380_write_ssb(s, 0x0400 /* TRANSMIT */, GOOD_COMPLETION);
     tms380_raise_irq(s, STS_IRQ_TRANSMIT_STATUS);
