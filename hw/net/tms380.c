@@ -55,6 +55,13 @@ static void tms380_cmd_status_cb(void *opaque)
     tms380_raise_irq(s, STS_IRQ_COMMAND_STATUS);
 }
 
+/* Deferred TRANSMIT_STATUS interrupt — gives BusyFlag time to propagate */
+static void tms380_tx_status_cb(void *opaque)
+{
+    TMS380PCIState *s = opaque;
+    tms380_raise_irq(s, STS_IRQ_TRANSMIT_STATUS);
+}
+
 /* --- DIO (Direct I/O) helpers --- */
 
 /* Read a 16-bit word from adapter SRAM at the current DIO address */
@@ -413,20 +420,23 @@ static void tms380_rx_poll(void *opaque)
     if (!(status & RX_VALID)) return;  /* RPL not ready */
 
     /* Get data buffer DMA address.
-     * FragList.DataAddr is __be32, written as htonl(dma_addr).
-     * Reading the raw 4 bytes as-is gives the byte-swapped value.
-     * Use ntohl (= read as LE u32) to get the original DMA address. */
-    uint32_t data_addr = rpl[10] | ((uint32_t)rpl[11] << 8) |
-                         ((uint32_t)rpl[12] << 16) | ((uint32_t)rpl[13] << 24);
+     * FragList.DataAddr is __be32 — the driver writes htonl(dma_addr).
+     * On LE x86, htonl byte-swaps, and the u32 is stored LSB-first.
+     * The net effect: the bytes in memory are in big-endian order.
+     * Read as BE u32 to recover the original physical DMA address. */
+    uint32_t data_addr = ((uint32_t)rpl[10] << 24) | ((uint32_t)rpl[11] << 16) |
+                         ((uint32_t)rpl[12] << 8) | rpl[13];
     if (!data_addr) return;
 
     qemu_log_mask(LOG_GUEST_ERROR,
-                  "tms380: RX: %d bytes → DMA 0x%08x [%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x]\n",
+                  "tms380: RX: %d bytes → DMA 0x%08x [%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x]\n",
                   n, data_addr,
                   n>0?frame[0]:0, n>1?frame[1]:0, n>2?frame[2]:0, n>3?frame[3]:0,
                   n>4?frame[4]:0, n>5?frame[5]:0, n>6?frame[6]:0, n>7?frame[7]:0,
                   n>8?frame[8]:0, n>9?frame[9]:0, n>10?frame[10]:0, n>11?frame[11]:0,
-                  n>12?frame[12]:0, n>13?frame[13]:0, n>14?frame[14]:0, n>15?frame[15]:0);
+                  n>12?frame[12]:0, n>13?frame[13]:0, n>14?frame[14]:0, n>15?frame[15]:0,
+                  n>16?frame[16]:0, n>17?frame[17]:0, n>18?frame[18]:0, n>19?frame[19]:0,
+                  n>20?frame[20]:0, n>21?frame[21]:0, n>22?frame[22]:0, n>23?frame[23]:0);
 
     /* DMA frame into guest buffer */
     cpu_physical_memory_write(data_addr, frame, n);
@@ -524,31 +534,17 @@ static void tms380_process_tx(TMS380PCIState *s)
     tpl[5] = (done_status >> 8) & 0xFF;
     cpu_physical_memory_write(s->tpl_addr + 4, &tpl[4], 2);
 
-    /* HACK: read BusyFlag from known offset to verify it's set.
-     * TPL struct on x86_64: 62 bytes packed + 2 pad + 8+8+8+4+pad+8+1 = varies
-     * Try dumping a range to find BusyFlag */
-    {
-        uint8_t tpl_dump[120];
-        cpu_physical_memory_read(s->tpl_addr, tpl_dump, 120);
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "tms380: TX: TPL[60-100]: %02x %02x %02x %02x %02x %02x %02x %02x "
-                      "%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x "
-                      "%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x "
-                      "%02x %02x %02x %02x %02x %02x %02x %02x\n",
-                      tpl_dump[60], tpl_dump[61], tpl_dump[62], tpl_dump[63],
-                      tpl_dump[64], tpl_dump[65], tpl_dump[66], tpl_dump[67],
-                      tpl_dump[68], tpl_dump[69], tpl_dump[70], tpl_dump[71],
-                      tpl_dump[72], tpl_dump[73], tpl_dump[74], tpl_dump[75],
-                      tpl_dump[76], tpl_dump[77], tpl_dump[78], tpl_dump[79],
-                      tpl_dump[80], tpl_dump[81], tpl_dump[82], tpl_dump[83],
-                      tpl_dump[84], tpl_dump[85], tpl_dump[86], tpl_dump[87],
-                      tpl_dump[88], tpl_dump[89], tpl_dump[90], tpl_dump[91],
-                      tpl_dump[92], tpl_dump[93], tpl_dump[94], tpl_dump[95],
-                      tpl_dump[96], tpl_dump[97], tpl_dump[98], tpl_dump[99]);
-    }
+    /* Advance to the next TPL in the chain (NextTPLAddr is BE32 at offset 0).
+     * The TMS380 walks TPLs until it hits one without TX_VALID. */
+    uint32_t next_tpl = ((uint32_t)tpl[0] << 24) | ((uint32_t)tpl[1] << 16) |
+                        ((uint32_t)tpl[2] << 8) | tpl[3];
+    s->tpl_addr = next_tpl;
 
-    /* Write SSB for transmit completion */
-    tms380_write_ssb(s, 0x0400 /* TRANSMIT */, GOOD_COMPLETION);
+    /* Raise TRANSMIT_STATUS with FRAME_COMPLETE (0x0040), not
+     * COMMAND_COMPLETE (0x0080). COMMAND_COMPLETE triggers the driver's
+     * cancel_tx_queue which frees TPLs without counting them.
+     * FRAME_COMPLETE lets tx_status_irq walk and count completed TPLs. */
+    tms380_write_ssb(s, 0x0400 /* TRANSMIT */, 0x0040 /* FRAME_COMPLETE */);
     tms380_raise_irq(s, STS_IRQ_TRANSMIT_STATUS);
 }
 
@@ -771,7 +767,15 @@ static void tms380_io_write(void *opaque, hwaddr addr, uint64_t val,
             break;
         }
 
-        /* Handle command bits */
+        /* Handle command bits.
+         * The Linux tms380tr driver's exec_sifcmd always ORs CMD_INTERRUPT_ADAPTER
+         * (0x8000) into every SIFCMD write. To distinguish real SCB commands from
+         * CMD_RX_VALID/CMD_TX_VALID writes, check for the actual SCB bits:
+         *   0x1000 = CMD_EXECUTE (driver bit, preserved through exec_sifcmd)
+         *   0x0800 = CMD_SCB_REQUEST
+         * Only these indicate a new SCB command. CMD_RX_VALID (0x0200) and
+         * CMD_TX_VALID (0x0100) must NOT trigger handle_scb. */
+#define WIRE_CMD_SCB_BITS  0x1800  /* CMD_EXECUTE | CMD_SCB_REQUEST on wire */
         if (v & (CMD_EXECUTE | CMD_INTERRUPT_ADAPTER)) {
             if (s->dev_state == TMS_STATE_BUD &&
                 (s->sifsts & STS_INITIALIZE)) {
@@ -779,11 +783,8 @@ static void tms380_io_write(void *opaque, hwaddr addr, uint64_t val,
                 tms380_handle_init(s);
             } else if (s->dev_state == TMS_STATE_READY ||
                        s->dev_state == TMS_STATE_OPEN) {
-                /* The driver sends commands via SCB in host memory.
-                 * CMD_INTERRUPT_ADAPTER signals a new command is ready.
-                 * Read the SCB from host memory to find the SRB. */
-                /* Only dispatch new commands, not SSB_CLEAR acks or TX_VALID writes */
-                if ((v & CMD_INTERRUPT_ADAPTER) && !(v & CMD_SSB_CLEAR) && !did_tx) {
+                /* Only dispatch SCB when the real SCB request bits are present */
+                if ((v & WIRE_CMD_SCB_BITS) && !(v & CMD_SSB_CLEAR) && !did_tx) {
                     tms380_handle_scb(s);
                 }
             }
@@ -798,12 +799,12 @@ static void tms380_io_write(void *opaque, hwaddr addr, uint64_t val,
             s->sifsts &= ~(STS_IRQ_MASK | 0x0080);
 
             /* The driver clears SSB to 0xFFFF right before this write.
-             * Overwrite with a "safe" value: STS=0 (not -1, passes chk_ssb)
-             * and Parm[0]=COMMAND_COMPLETE (0x0080) so the TRANSMIT_STATUS
-             * handler can clear TransmitCommandActive. */
+             * Overwrite with zeros so chk_ssb() won't report DATA LATE
+             * (it checks ssb->STS != 0xFFFF). Don't set COMMAND_COMPLETE
+             * (0x0080) — that triggers cancel_tx_queue which frees TPLs
+             * without counting them. */
             {
                 uint8_t ssb_safe[8] = {0};
-                ssb_safe[2] = 0x80;  /* Parm[0] LE low = COMMAND_COMPLETE */
                 cpu_physical_memory_write(s->ssb_addr, ssb_safe, 8);
             }
 
@@ -884,6 +885,7 @@ static void tms380_pci_realize(PCIDevice *pci_dev, Error **errp)
      * the vCPU is halted (e.g., in interruptible_sleep_on). */
     s->scb_clear_timer = timer_new_ns(QEMU_CLOCK_REALTIME, tms380_scb_clear_cb, s);
     s->cmd_status_timer = timer_new_ns(QEMU_CLOCK_REALTIME, tms380_cmd_status_cb, s);
+    s->tx_status_timer = timer_new_ns(QEMU_CLOCK_REALTIME, tms380_tx_status_cb, s);
 
     /* Load backend if configured */
     tms380_load_backend(s);

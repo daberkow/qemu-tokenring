@@ -126,6 +126,7 @@ struct TMS380PCIState {
     /* Deferred interrupt timers */
     QEMUTimer *scb_clear_timer;
     QEMUTimer *cmd_status_timer;
+    QEMUTimer *tx_status_timer;
 
     /* tr_backend FFI — loaded via dlopen */
     void *backend_lib;
