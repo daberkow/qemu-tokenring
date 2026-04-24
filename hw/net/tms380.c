@@ -368,10 +368,11 @@ static void tms380_handle_scb(TMS380PCIState *s)
 
 /* --- RX processing --- */
 
-#define RX_VALID        0x0080
-#define RX_START_FRAME  0x0020
-#define RX_END_FRAME    0x0010
-#define RX_FRAME_IRQ    0x0008
+#define RX_VALID          0x0080
+#define RX_FRAME_COMPLETE 0x0040
+#define RX_START_FRAME    0x0020
+#define RX_END_FRAME      0x0010
+#define RX_FRAME_IRQ      0x0008
 
 /* Called when the raw backend's recv fd is readable — a frame arrived */
 static void tms380_rx_poll(void *opaque)
@@ -424,21 +425,25 @@ static void tms380_rx_poll(void *opaque)
     /* DMA frame into guest buffer */
     cpu_physical_memory_write(data_addr, frame, n);
 
-    /* Update RPL: FrameSize (BE) + completion status (LE, clear RX_VALID) */
-    rpl[6] = (n >> 8) & 0xFF;
-    rpl[7] = n & 0xFF;
-    uint16_t done = RX_START_FRAME | RX_END_FRAME | RX_FRAME_IRQ;
-    rpl[4] = done & 0xFF;
-    rpl[5] = (done >> 8) & 0xFF;
-    cpu_physical_memory_write(s->rpl_addr + 4, &rpl[4], 4);
+    /* Write FrameSize (BE, at offset 6) BEFORE Status (LE, at offset 4).
+     * The driver polls Status to detect ready RPLs. If Status is updated
+     * before FrameSize, the driver reads FrameSize=0 and rejects. */
+    {
+        uint8_t fsz[2] = { (n >> 8) & 0xFF, n & 0xFF };
+        cpu_physical_memory_write(s->rpl_addr + 6, fsz, 2);
+    }
+    /* Now clear RX_VALID in Status to signal completion */
+    {
+        uint16_t done = RX_START_FRAME | RX_END_FRAME | RX_FRAME_COMPLETE | RX_FRAME_IRQ;
+        uint8_t sts[2] = { done & 0xFF, (done >> 8) & 0xFF };
+        cpu_physical_memory_write(s->rpl_addr + 4, sts, 2);
+    }
 
     /* Advance to next RPL (BE u32, odd bit = last) */
     uint32_t next = ((uint32_t)rpl[0] << 24) | ((uint32_t)rpl[1] << 16) |
                     ((uint32_t)rpl[2] << 8) | rpl[3];
     if (!(next & 1) && next) s->rpl_addr = next;
 
-    /* Write SSB with RECEIVE status and raise interrupt.
-     * The driver's chk_ssb checks ssb.STS != 0xFFFF for RECEIVE. */
     tms380_write_ssb(s, OC_RECEIVE, GOOD_COMPLETION);
     tms380_raise_irq(s, STS_IRQ_RECEIVE_STATUS);
 }
@@ -758,10 +763,19 @@ static void tms380_io_write(void *opaque, hwaddr addr, uint64_t val,
             uint16_t prev_irq = s->sifsts & STS_IRQ_MASK;
             pci_irq_deassert(&s->parent_obj);
             s->sifsts &= ~(STS_IRQ_MASK | 0x0080);
-            /* Only fire SCB_CLEAR after a real command, not after SCB_CLEAR itself */
+
+            /* The driver clears SSB to 0xFFFF right before this write.
+             * Immediately overwrite with zeros so chk_ssb never sees -1.
+             * This prevents DATA LATE on the next interrupt. */
+            {
+                uint8_t zeros[8] = {0};
+                cpu_physical_memory_write(s->ssb_addr, zeros, 8);
+            }
+
+            /* Only fire SCB_CLEAR after a real command */
             if (prev_irq == STS_IRQ_COMMAND_STATUS) {
                 timer_mod(s->scb_clear_timer,
-                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100 * SCALE_US);
+                          qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 100 * SCALE_US);
             }
         }
         /* Also clear on any low-byte write without CMD_INTERRUPT_ADAPTER */
