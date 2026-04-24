@@ -420,7 +420,13 @@ static void tms380_rx_poll(void *opaque)
                          ((uint32_t)rpl[12] << 16) | ((uint32_t)rpl[13] << 24);
     if (!data_addr) return;
 
-    qemu_log_mask(LOG_GUEST_ERROR, "tms380: RX: %d bytes → DMA 0x%08x\n", n, data_addr);
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "tms380: RX: %d bytes → DMA 0x%08x [%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x]\n",
+                  n, data_addr,
+                  n>0?frame[0]:0, n>1?frame[1]:0, n>2?frame[2]:0, n>3?frame[3]:0,
+                  n>4?frame[4]:0, n>5?frame[5]:0, n>6?frame[6]:0, n>7?frame[7]:0,
+                  n>8?frame[8]:0, n>9?frame[9]:0, n>10?frame[10]:0, n>11?frame[11]:0,
+                  n>12?frame[12]:0, n>13?frame[13]:0, n>14?frame[14]:0, n>15?frame[15]:0);
 
     /* DMA frame into guest buffer */
     cpu_physical_memory_write(data_addr, frame, n);
@@ -451,10 +457,11 @@ static void tms380_rx_poll(void *opaque)
 /* --- TX processing --- */
 
 /* TPL status bits */
-#define TX_VALID        0x0080
-#define TX_START_FRAME  0x0020
-#define TX_END_FRAME    0x0010
-#define TX_FRAME_IRQ    0x0008
+#define TX_VALID          0x0080
+#define TX_FRAME_COMPLETE 0x0040
+#define TX_START_FRAME    0x0020
+#define TX_END_FRAME      0x0010
+#define TX_FRAME_IRQ      0x0008
 
 /* Process pending transmit: read TPL from host memory, extract frame, send */
 static void tms380_process_tx(TMS380PCIState *s)
@@ -512,7 +519,7 @@ static void tms380_process_tx(TMS380PCIState *s)
 
     /* Mark TPL as complete: clear TX_VALID, set completion status.
      * Write status back as LE u16 at offset 4. */
-    uint16_t done_status = TX_START_FRAME | TX_END_FRAME | TX_FRAME_IRQ;
+    uint16_t done_status = TX_START_FRAME | TX_END_FRAME | TX_FRAME_COMPLETE | TX_FRAME_IRQ;
     tpl[4] = done_status & 0xFF;
     tpl[5] = (done_status >> 8) & 0xFF;
     cpu_physical_memory_write(s->tpl_addr + 4, &tpl[4], 2);
@@ -725,9 +732,12 @@ static void tms380_io_write(void *opaque, hwaddr addr, uint64_t val,
         qemu_log_mask(LOG_GUEST_ERROR, "tms380: SIFCMD write 0x%04x state=%d\n",
                       v, s->dev_state);
 
-        /* CMD_TX_VALID (0x0100): driver signals a TPL is ready to transmit */
-        if (v & 0x0100) {
+        /* CMD_TX_VALID (0x0100): driver signals a TPL is ready to transmit.
+         * Track whether we processed TX to avoid double-dispatching. */
+        int did_tx = 0;
+        if ((v & 0x0100) && s->dev_state == TMS_STATE_OPEN && s->tpl_addr) {
             tms380_process_tx(s);
+            did_tx = 1;
         }
 
         /* EXEC_SOFT_RESET: the driver sends 0xFF80 (or similar high-byte-set
@@ -749,8 +759,8 @@ static void tms380_io_write(void *opaque, hwaddr addr, uint64_t val,
                 /* The driver sends commands via SCB in host memory.
                  * CMD_INTERRUPT_ADAPTER signals a new command is ready.
                  * Read the SCB from host memory to find the SRB. */
-                /* Only dispatch new commands, not SSB_CLEAR acks */
-                if ((v & CMD_INTERRUPT_ADAPTER) && !(v & CMD_SSB_CLEAR)) {
+                /* Only dispatch new commands, not SSB_CLEAR acks or TX_VALID writes */
+                if ((v & CMD_INTERRUPT_ADAPTER) && !(v & CMD_SSB_CLEAR) && !did_tx) {
                     tms380_handle_scb(s);
                 }
             }
@@ -765,11 +775,13 @@ static void tms380_io_write(void *opaque, hwaddr addr, uint64_t val,
             s->sifsts &= ~(STS_IRQ_MASK | 0x0080);
 
             /* The driver clears SSB to 0xFFFF right before this write.
-             * Immediately overwrite with zeros so chk_ssb never sees -1.
-             * This prevents DATA LATE on the next interrupt. */
+             * Overwrite with a "safe" value: STS=0 (not -1, passes chk_ssb)
+             * and Parm[0]=COMMAND_COMPLETE (0x0080) so the TRANSMIT_STATUS
+             * handler can clear TransmitCommandActive. */
             {
-                uint8_t zeros[8] = {0};
-                cpu_physical_memory_write(s->ssb_addr, zeros, 8);
+                uint8_t ssb_safe[8] = {0};
+                ssb_safe[2] = 0x80;  /* Parm[0] LE low = COMMAND_COMPLETE */
+                cpu_physical_memory_write(s->ssb_addr, ssb_safe, 8);
             }
 
             /* Only fire SCB_CLEAR after a real command */
